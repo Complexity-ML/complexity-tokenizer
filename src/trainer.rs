@@ -332,8 +332,8 @@ impl InlBpeTrainer {
     /// Update token frequencies after merge
     fn update_frequencies(
         &mut self,
-        pair: &(String, String),
-        merged: &str,
+        _pair: &(String, String),
+        _merged: &str,
         word_freqs: &HashMap<String, u32>,
         word_tokens: &HashMap<String, Vec<String>>,
     ) {

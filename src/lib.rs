@@ -19,10 +19,11 @@ pub use huggingface::HuggingFaceTokenizer;
 pub use trainer::{InlBpeTrainer, TrainerConfig};
 
 use pyo3::prelude::*;
+use std::collections::HashMap as StdHashMap;
 
 /// Python module
 #[pymodule]
-fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn complexity_tokenizer(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyTrainer>()?;
     m.add("__version__", "0.1.2")?;
@@ -91,8 +92,11 @@ impl PyTokenizer {
 
     /// Get special tokens
     #[getter]
-    fn special_tokens(&self) -> PyResult<std::collections::HashMap<String, u32>> {
-        Ok(self.inner.special_tokens().clone())
+    fn special_tokens(&self) -> PyResult<StdHashMap<String, u32>> {
+        // Convert hashbrown::HashMap to std::collections::HashMap
+        Ok(self.inner.special_tokens().iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect())
     }
 
     /// Save tokenizer to file (HuggingFace format)
