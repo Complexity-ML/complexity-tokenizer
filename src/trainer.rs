@@ -179,12 +179,14 @@ impl InlBpeTrainer {
         }
 
         // Convert words to token ID sequences
-        let words: Vec<Word> = word_freqs
+        // Collect to Vec first for parallel iteration (hashbrown doesn't have par_iter)
+        let word_vec: Vec<(&String, &u32)> = word_freqs.iter().collect();
+        let words: Vec<Word> = word_vec
             .par_iter()
             .map(|(word, &freq)| {
                 let tokens: Vec<u32> = word
                     .chars()
-                    .filter_map(|c| self.vocab.get(&c.to_string()).copied())
+                    .filter_map(|c: char| self.vocab.get(&c.to_string()).copied())
                     .collect();
                 Word { tokens, freq }
             })
