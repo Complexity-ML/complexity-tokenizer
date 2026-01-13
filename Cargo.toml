@@ -31,12 +31,7 @@ pyo3 = { version = "0.20", features = ["extension-module"] }
 ureq = { version = "2.9", features = ["json"] }
 
 [dev-dependencies]
-criterion = "0.5"
 tempfile = "3.10"
-
-[[bench]]
-name = "tokenizer_bench"
-harness = false
 
 [profile.release]
 lto = true
