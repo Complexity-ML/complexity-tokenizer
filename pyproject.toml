@@ -1,0 +1,43 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "complexity-tokenizer"
+version = "0.1.0"
+description = "Fast BPE tokenizer in Rust with HuggingFace compatibility"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Complexity-ML", email = "contact@complexity-ml.org"}
+]
+keywords = ["tokenizer", "bpe", "nlp", "huggingface", "rust", "fast"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Linguistic",
+]
+requires-python = ">=3.8"
+
+[project.urls]
+Homepage = "https://github.com/Complexity-ML/complexity-tokenizer"
+Repository = "https://github.com/Complexity-ML/complexity-tokenizer"
+Documentation = "https://github.com/Complexity-ML/complexity-tokenizer#readme"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "maturin>=1.4"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "complexity_tokenizer"

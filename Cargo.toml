@@ -1,0 +1,44 @@
+[package]
+name = "complexity-tokenizer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Complexity-ML"]
+description = "Fast BPE tokenizer in Rust with HuggingFace compatibility"
+license = "Apache-2.0"
+repository = "https://github.com/Complexity-ML/complexity-tokenizer"
+keywords = ["tokenizer", "bpe", "nlp", "huggingface", "rust"]
+
+[lib]
+name = "complexity_tokenizer"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Core
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.10"
+unicode-segmentation = "1.10"
+
+# Performance
+rayon = "1.8"
+hashbrown = "0.14"
+ahash = "0.8"
+
+# Python bindings
+pyo3 = { version = "0.20", features = ["extension-module"] }
+
+# HTTP for HuggingFace Hub
+ureq = { version = "2.9", features = ["json"] }
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.10"
+
+[[bench]]
+name = "tokenizer_bench"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
