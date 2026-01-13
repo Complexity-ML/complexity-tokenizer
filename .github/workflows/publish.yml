@@ -39,8 +39,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write  # Required for trusted publishing
+    environment: pypi
 
     steps:
       - name: Download all wheels
@@ -51,6 +50,9 @@ jobs:
           merge-multiple: true
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          pip install twine
+          twine upload dist/*
