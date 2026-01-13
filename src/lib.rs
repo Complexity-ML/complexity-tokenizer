@@ -25,7 +25,7 @@ use pyo3::prelude::*;
 fn complexity_tokenizer(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyTrainer>()?;
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", "0.1.1")?;
     Ok(())
 }
 
