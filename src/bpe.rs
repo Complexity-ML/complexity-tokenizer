@@ -2,8 +2,6 @@
 
 use hashbrown::HashMap;
 use rayon::prelude::*;
-use std::collections::BinaryHeap;
-use std::cmp::Ordering;
 
 /// Merge operation (pair -> new token)
 #[derive(Debug, Clone)]

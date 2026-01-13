@@ -4,7 +4,6 @@
 //! INL dynamics to balance the vocabulary distribution.
 
 use hashbrown::{HashMap, HashSet};
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -262,7 +261,7 @@ impl InlBpeTrainer {
             let base_score = freq as f32;
 
             // INL dynamics for each token in the pair
-            let merged = format!("{}{}", pair.0, pair.1);
+            let _merged = format!("{}{}", pair.0, pair.1);
 
             // Get current frequencies
             let freq_a = *self.token_freqs.get(&pair.0).unwrap_or(&0) as f32;
