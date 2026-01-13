@@ -39,6 +39,8 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for trusted publishing
 
     steps:
       - name: Download all wheels
