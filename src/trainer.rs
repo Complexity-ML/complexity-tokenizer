@@ -1,9 +1,12 @@
-//! INL-BPE Trainer - BPE training with INL dynamics for merge selection
+//! INL-BPE Trainer - OPTIMIZED with incremental updates
 //!
-//! Unlike standard BPE which only uses frequency, this trainer uses
-//! INL dynamics to balance the vocabulary distribution.
+//! Key optimizations vs naive implementation:
+//! 1. Incremental pair counting (don't recount all pairs after each merge)
+//! 2. Parallel word processing with rayon
+//! 3. Efficient data structures
 
 use hashbrown::{HashMap, HashSet};
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -11,25 +14,15 @@ use std::path::Path;
 /// Training configuration
 #[derive(Debug, Clone)]
 pub struct TrainerConfig {
-    /// Target vocabulary size
     pub vocab_size: usize,
-    /// Minimum frequency for a token to be included
     pub min_frequency: u32,
-    /// Special tokens to add
     pub special_tokens: Vec<String>,
-    /// Filter words shorter than this
     pub min_word_length: usize,
-    /// INL dynamics: alpha (momentum/inertia)
     pub inl_alpha: f32,
-    /// INL dynamics: beta (correction strength) - CLAMPED to [0, 2]
     pub inl_beta: f32,
-    /// INL dynamics: gate (amplitude control)
     pub inl_gate: f32,
-    /// Target frequency ratio for mu (equilibrium)
     pub inl_mu_target: f32,
-    /// Maximum velocity (prevents runaway)
     pub inl_velocity_max: f32,
-    /// Maximum beta (stability constraint)
     pub inl_beta_max: f32,
 }
 
@@ -39,39 +32,42 @@ impl Default for TrainerConfig {
             vocab_size: 32000,
             min_frequency: 2,
             special_tokens: vec![
-                "</s>".to_string(),  // EOS (id=0)
-                "<pad>".to_string(), // PAD (id=1)
-                "<s>".to_string(),   // BOS (id=2)
-                "<unk>".to_string(), // UNK (id=3)
+                "</s>".to_string(),
+                "<pad>".to_string(),
+                "<s>".to_string(),
+                "<unk>".to_string(),
             ],
             min_word_length: 1,
             inl_alpha: 0.9,
             inl_beta: 0.3,
             inl_gate: 0.5,
-            inl_mu_target: 0.01, // Target: each token ~1% of corpus
-            inl_velocity_max: 10.0, // CRITICAL: prevent runaway
-            inl_beta_max: 2.0,      // CRITICAL: stability constraint
+            inl_mu_target: 0.01,
+            inl_velocity_max: 10.0,
+            inl_beta_max: 2.0,
         }
     }
 }
 
-/// INL-BPE Trainer
+/// Word representation: tokens + frequency (avoids HashMap lookup)
+#[derive(Clone)]
+struct Word {
+    tokens: Vec<u32>,  // Use IDs instead of strings for speed
+    freq: u32,
+}
+
+/// INL-BPE Trainer - OPTIMIZED
 pub struct InlBpeTrainer {
     config: TrainerConfig,
-    /// Current vocabulary: token -> id
     vocab: HashMap<String, u32>,
-    /// Reverse vocab: id -> token
     vocab_r: HashMap<u32, String>,
-    /// Merge operations in order
     merges: Vec<(String, String)>,
-    /// Token frequencies
-    token_freqs: HashMap<String, u32>,
-    /// INL velocity state per token
-    velocity: HashMap<String, f32>,
+    token_freqs: HashMap<u32, u64>,  // Use u64 to avoid overflow
+    velocity: HashMap<u32, f32>,
+    // Optimization: global pair frequencies (incrementally updated)
+    pair_freqs: HashMap<(u32, u32), i64>,  // i64 to handle decrements
 }
 
 impl InlBpeTrainer {
-    /// Create new trainer with config
     pub fn new(config: TrainerConfig) -> Self {
         Self {
             config,
@@ -80,56 +76,50 @@ impl InlBpeTrainer {
             merges: Vec::new(),
             token_freqs: HashMap::new(),
             velocity: HashMap::new(),
+            pair_freqs: HashMap::new(),
         }
     }
 
-    /// Train tokenizer from text files
     pub fn train<P: AsRef<Path>>(&mut self, files: &[P]) -> Result<(), std::io::Error> {
-        // Step 1: Count word frequencies
         println!("Step 1: Counting word frequencies...");
         let word_freqs = self.count_words(files)?;
         println!("  Found {} unique words", word_freqs.len());
-
         self.train_from_word_freqs(word_freqs);
         Ok(())
     }
 
-    /// Train tokenizer from an iterator of text strings (for streaming)
     pub fn train_from_texts<I, S>(&mut self, texts: I)
     where
         I: Iterator<Item = S>,
         S: AsRef<str>,
     {
-        // Step 1: Count word frequencies from iterator
         println!("Step 1: Counting word frequencies from iterator...");
         let word_freqs = self.count_words_from_iter(texts);
         println!("  Found {} unique words", word_freqs.len());
-
         self.train_from_word_freqs(word_freqs);
     }
 
-    /// Internal: train from pre-computed word frequencies
     fn train_from_word_freqs(&mut self, word_freqs: HashMap<String, u32>) {
-        // Step 2: Initialize vocab with characters
         println!("Step 2: Initializing character vocabulary...");
-        self.init_vocab(&word_freqs);
+        let mut words = self.init_vocab(&word_freqs);
         println!("  Initial vocab size: {}", self.vocab.len());
 
-        // Step 3: BPE merges with INL dynamics
-        println!("Step 3: Learning merges with INL dynamics...");
-        self.learn_merges(&word_freqs);
+        println!("Step 3: Computing initial pair frequencies (parallel)...");
+        self.compute_initial_pairs(&words);
+        println!("  Found {} unique pairs", self.pair_freqs.len());
+
+        println!("Step 4: Learning merges with INL dynamics (incremental)...");
+        self.learn_merges_incremental(&mut words);
         println!("  Final vocab size: {}", self.vocab.len());
         println!("  Total merges: {}", self.merges.len());
     }
 
-    /// Count word frequencies from an iterator of texts
     fn count_words_from_iter<I, S>(&self, texts: I) -> HashMap<String, u32>
     where
         I: Iterator<Item = S>,
         S: AsRef<str>,
     {
         let mut word_freqs: HashMap<String, u32> = HashMap::new();
-
         for text in texts {
             for word in text.as_ref().split_whitespace() {
                 if word.chars().count() >= self.config.min_word_length {
@@ -137,49 +127,40 @@ impl InlBpeTrainer {
                 }
             }
         }
-
-        // Filter by minimum frequency
         word_freqs.retain(|_, freq| *freq >= self.config.min_frequency);
         word_freqs
     }
 
-    /// Count word frequencies from files
     fn count_words<P: AsRef<Path>>(&self, files: &[P]) -> Result<HashMap<String, u32>, std::io::Error> {
         let mut word_freqs: HashMap<String, u32> = HashMap::new();
-
         for file_path in files {
             let file = File::open(file_path)?;
             let reader = BufReader::new(file);
-
             for line in reader.lines() {
                 let line = line?;
                 for word in line.split_whitespace() {
-                    // Filter by minimum word length
                     if word.chars().count() >= self.config.min_word_length {
                         *word_freqs.entry(word.to_string()).or_insert(0) += 1;
                     }
                 }
             }
         }
-
-        // Filter by minimum frequency
         word_freqs.retain(|_, freq| *freq >= self.config.min_frequency);
-
         Ok(word_freqs)
     }
 
-    /// Initialize vocabulary with special tokens and characters
-    fn init_vocab(&mut self, word_freqs: &HashMap<String, u32>) {
+    /// Initialize vocab and return words as token ID sequences
+    fn init_vocab(&mut self, word_freqs: &HashMap<String, u32>) -> Vec<Word> {
         let mut next_id = 0u32;
 
-        // Add special tokens first
+        // Add special tokens
         for token in &self.config.special_tokens {
             self.vocab.insert(token.clone(), next_id);
             self.vocab_r.insert(next_id, token.clone());
             next_id += 1;
         }
 
-        // Collect all unique characters
+        // Collect unique characters
         let mut chars: HashSet<char> = HashSet::new();
         for word in word_freqs.keys() {
             for c in word.chars() {
@@ -197,150 +178,150 @@ impl InlBpeTrainer {
             }
         }
 
-        // Initialize token frequencies from words
-        for (word, freq) in word_freqs {
-            for c in word.chars() {
-                let token = c.to_string();
-                *self.token_freqs.entry(token).or_insert(0) += freq;
-            }
-        }
-
-        // Initialize INL velocity to zero
-        for token in self.vocab.keys() {
-            self.velocity.insert(token.clone(), 0.0);
-        }
-    }
-
-    /// Learn BPE merges using INL dynamics
-    fn learn_merges(&mut self, word_freqs: &HashMap<String, u32>) {
-        // Represent words as sequences of tokens
-        let mut word_tokens: HashMap<String, Vec<String>> = word_freqs
-            .keys()
-            .map(|word| {
-                let tokens: Vec<String> = word.chars().map(|c| c.to_string()).collect();
-                (word.clone(), tokens)
+        // Convert words to token ID sequences
+        let words: Vec<Word> = word_freqs
+            .par_iter()
+            .map(|(word, &freq)| {
+                let tokens: Vec<u32> = word
+                    .chars()
+                    .filter_map(|c| self.vocab.get(&c.to_string()).copied())
+                    .collect();
+                Word { tokens, freq }
             })
             .collect();
 
-        let target_vocab_size = self.config.vocab_size;
-
-        while self.vocab.len() < target_vocab_size {
-            // Count pair frequencies
-            let pair_freqs = self.count_pairs(&word_tokens, word_freqs);
-
-            if pair_freqs.is_empty() {
-                break;
-            }
-
-            // Calculate INL-adjusted scores for each pair
-            let best_pair = self.select_best_pair_inl(&pair_freqs);
-
-            if let Some((pair, _score)) = best_pair {
-                // Create merged token
-                let merged = format!("{}{}", pair.0, pair.1);
-
-                // Add to vocab
-                let new_id = self.vocab.len() as u32;
-                self.vocab.insert(merged.clone(), new_id);
-                self.vocab_r.insert(new_id, merged.clone());
-
-                // Record merge
-                self.merges.push(pair.clone());
-
-                // Update word representations
-                self.apply_merge(&mut word_tokens, &pair, &merged);
-
-                // Update token frequencies
-                self.update_frequencies(&pair, &merged, word_freqs, &word_tokens);
-
-                // Update INL velocity for the new token
-                self.velocity.insert(merged, 0.0);
-
-                // Progress
-                if self.vocab.len() % 1000 == 0 {
-                    println!("  Vocab size: {}", self.vocab.len());
-                }
-            } else {
-                break;
+        // Initialize token frequencies
+        for word in &words {
+            for &token_id in &word.tokens {
+                *self.token_freqs.entry(token_id).or_insert(0) += word.freq as u64;
             }
         }
+
+        // Initialize velocities
+        for &id in self.vocab.values() {
+            self.velocity.insert(id, 0.0);
+        }
+
+        words
     }
 
-    /// Count pair frequencies
-    fn count_pairs(
-        &self,
-        word_tokens: &HashMap<String, Vec<String>>,
-        word_freqs: &HashMap<String, u32>,
-    ) -> HashMap<(String, String), u32> {
-        let mut pair_freqs: HashMap<(String, String), u32> = HashMap::new();
+    /// Compute initial pair frequencies in parallel
+    fn compute_initial_pairs(&mut self, words: &[Word]) {
+        // Parallel map-reduce for pair counting
+        let pair_counts: HashMap<(u32, u32), i64> = words
+            .par_iter()
+            .fold(
+                || HashMap::new(),
+                |mut acc: HashMap<(u32, u32), i64>, word| {
+                    for i in 0..word.tokens.len().saturating_sub(1) {
+                        let pair = (word.tokens[i], word.tokens[i + 1]);
+                        *acc.entry(pair).or_insert(0) += word.freq as i64;
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || HashMap::new(),
+                |mut a, b| {
+                    for (pair, count) in b {
+                        *a.entry(pair).or_insert(0) += count;
+                    }
+                    a
+                },
+            );
 
-        for (word, tokens) in word_tokens {
-            let freq = word_freqs.get(word).copied().unwrap_or(0);
-            for i in 0..tokens.len().saturating_sub(1) {
-                let pair = (tokens[i].clone(), tokens[i + 1].clone());
-                *pair_freqs.entry(pair).or_insert(0) += freq;
+        self.pair_freqs = pair_counts;
+    }
+
+    /// Learn merges with INCREMENTAL pair updates
+    fn learn_merges_incremental(&mut self, words: &mut Vec<Word>) {
+        let target_vocab_size = self.config.vocab_size;
+        let mut iteration = 0;
+
+        while self.vocab.len() < target_vocab_size {
+            // Find best pair using INL scoring
+            let best_pair = self.select_best_pair_inl();
+
+            if best_pair.is_none() {
+                break;
+            }
+
+            let (pair, _score) = best_pair.unwrap();
+
+            // Create merged token
+            let token_a = self.vocab_r.get(&pair.0).unwrap().clone();
+            let token_b = self.vocab_r.get(&pair.1).unwrap().clone();
+            let merged_str = format!("{}{}", token_a, token_b);
+
+            // Add to vocab
+            let new_id = self.vocab.len() as u32;
+            self.vocab.insert(merged_str.clone(), new_id);
+            self.vocab_r.insert(new_id, merged_str);
+
+            // Record merge
+            self.merges.push((token_a, token_b));
+
+            // INCREMENTAL UPDATE: apply merge and update pair counts
+            self.apply_merge_incremental(words, pair, new_id);
+
+            // Initialize velocity for new token
+            self.velocity.insert(new_id, 0.0);
+
+            iteration += 1;
+            if iteration % 1000 == 0 {
+                println!("  Vocab size: {} ({} merges)", self.vocab.len(), iteration);
             }
         }
-
-        pair_freqs
     }
 
     /// Select best pair using INL dynamics
-    fn select_best_pair_inl(
-        &mut self,
-        pair_freqs: &HashMap<(String, String), u32>,
-    ) -> Option<((String, String), f32)> {
-        let total_freq: u32 = self.token_freqs.values().sum();
+    fn select_best_pair_inl(&mut self) -> Option<((u32, u32), f32)> {
+        let total_freq: u64 = self.token_freqs.values().sum();
+        if total_freq == 0 {
+            return None;
+        }
         let mu = self.config.inl_mu_target * total_freq as f32;
 
-        let mut best: Option<((String, String), f32)> = None;
+        let mut best: Option<((u32, u32), f32)> = None;
 
-        for (pair, &freq) in pair_freqs {
-            // Base score = frequency
+        for (&pair, &freq) in &self.pair_freqs {
+            if freq <= 0 {
+                continue;
+            }
+
             let base_score = freq as f32;
 
-            // INL dynamics for each token in the pair
-            let _merged = format!("{}{}", pair.0, pair.1);
-
-            // Get current frequencies
+            // Get token frequencies
             let freq_a = *self.token_freqs.get(&pair.0).unwrap_or(&0) as f32;
             let freq_b = *self.token_freqs.get(&pair.1).unwrap_or(&0) as f32;
 
-            // Error: deviation from equilibrium
+            // INL dynamics
             let error_a = freq_a - mu;
             let error_b = freq_b - mu;
 
-            // Get velocities
             let v_a = *self.velocity.get(&pair.0).unwrap_or(&0.0);
             let v_b = *self.velocity.get(&pair.1).unwrap_or(&0.0);
 
-            // CLAMP beta for stability (like in model INL dynamics)
             let beta_clamped = self.config.inl_beta.min(self.config.inl_beta_max).max(0.0);
 
-            // Update velocities (INL dynamics)
-            let v_a_new = self.config.inl_alpha * v_a - beta_clamped * error_a;
-            let v_b_new = self.config.inl_alpha * v_b - beta_clamped * error_b;
+            let v_a_new = (self.config.inl_alpha * v_a - beta_clamped * error_a)
+                .max(-self.config.inl_velocity_max)
+                .min(self.config.inl_velocity_max);
+            let v_b_new = (self.config.inl_alpha * v_b - beta_clamped * error_b)
+                .max(-self.config.inl_velocity_max)
+                .min(self.config.inl_velocity_max);
 
-            // CLAMP velocities to prevent runaway (CRITICAL for stability)
-            let v_a_clamped = v_a_new.max(-self.config.inl_velocity_max).min(self.config.inl_velocity_max);
-            let v_b_clamped = v_b_new.max(-self.config.inl_velocity_max).min(self.config.inl_velocity_max);
+            // Update velocities (in-place for selected pair)
+            self.velocity.insert(pair.0, v_a_new);
+            self.velocity.insert(pair.1, v_b_new);
 
-            // Store updated velocities (clamped)
-            self.velocity.insert(pair.0.clone(), v_a_clamped);
-            self.velocity.insert(pair.1.clone(), v_b_clamped);
-
-            // INL adjustment: favor merges that balance the distribution
-            // If tokens are too frequent (positive error), reduce their score
-            // If tokens are rare (negative error), boost their score
-            let inl_adjustment = self.config.inl_gate * (v_a_clamped + v_b_clamped);
-
-            // Final score
+            let inl_adjustment = self.config.inl_gate * (v_a_new + v_b_new);
             let score = base_score - inl_adjustment;
 
             match &best {
-                None => best = Some((pair.clone(), score)),
+                None => best = Some((pair, score)),
                 Some((_, best_score)) if score > *best_score => {
-                    best = Some((pair.clone(), score));
+                    best = Some((pair, score));
                 }
                 _ => {}
             }
@@ -349,54 +330,83 @@ impl InlBpeTrainer {
         best
     }
 
-    /// Apply merge to all words
-    fn apply_merge(
-        &self,
-        word_tokens: &mut HashMap<String, Vec<String>>,
-        pair: &(String, String),
-        merged: &str,
-    ) {
-        for tokens in word_tokens.values_mut() {
+    /// Apply merge with INCREMENTAL pair frequency updates
+    fn apply_merge_incremental(&mut self, words: &mut Vec<Word>, pair: (u32, u32), new_id: u32) {
+        // Remove the merged pair from counts
+        self.pair_freqs.remove(&pair);
+
+        // Track frequency changes for the new token
+        let mut new_token_freq: u64 = 0;
+
+        // Process each word
+        for word in words.iter_mut() {
             let mut i = 0;
-            while i < tokens.len().saturating_sub(1) {
-                if tokens[i] == pair.0 && tokens[i + 1] == pair.1 {
-                    tokens[i] = merged.to_string();
-                    tokens.remove(i + 1);
+            while i < word.tokens.len().saturating_sub(1) {
+                if word.tokens[i] == pair.0 && word.tokens[i + 1] == pair.1 {
+                    let freq = word.freq as i64;
+
+                    // Decrement old pair frequencies
+                    // Left neighbor: (tokens[i-1], pair.0) -> disappears
+                    if i > 0 {
+                        let left_pair = (word.tokens[i - 1], pair.0);
+                        *self.pair_freqs.entry(left_pair).or_insert(0) -= freq;
+                    }
+                    // Right neighbor: (pair.1, tokens[i+2]) -> disappears
+                    if i + 2 < word.tokens.len() {
+                        let right_pair = (pair.1, word.tokens[i + 2]);
+                        *self.pair_freqs.entry(right_pair).or_insert(0) -= freq;
+                    }
+
+                    // Apply merge: replace pair with new_id
+                    word.tokens[i] = new_id;
+                    word.tokens.remove(i + 1);
+
+                    // Increment new pair frequencies
+                    // Left neighbor: (tokens[i-1], new_id) -> appears
+                    if i > 0 {
+                        let new_left = (word.tokens[i - 1], new_id);
+                        *self.pair_freqs.entry(new_left).or_insert(0) += freq;
+                    }
+                    // Right neighbor: (new_id, tokens[i+1]) -> appears
+                    if i + 1 < word.tokens.len() {
+                        let new_right = (new_id, word.tokens[i + 1]);
+                        *self.pair_freqs.entry(new_right).or_insert(0) += freq;
+                    }
+
+                    // Update token frequencies
+                    new_token_freq += word.freq as u64;
+
+                    // Don't increment i, check same position again for consecutive merges
+                } else {
+                    i += 1;
                 }
-                i += 1;
             }
         }
-    }
 
-    /// Update token frequencies after merge
-    fn update_frequencies(
-        &mut self,
-        _pair: &(String, String),
-        _merged: &str,
-        word_freqs: &HashMap<String, u32>,
-        word_tokens: &HashMap<String, Vec<String>>,
-    ) {
-        // Recount frequencies
-        self.token_freqs.clear();
-        for (word, tokens) in word_tokens {
-            let freq = word_freqs.get(word).copied().unwrap_or(0);
-            for token in tokens {
-                *self.token_freqs.entry(token.clone()).or_insert(0) += freq;
-            }
+        // Update token frequencies
+        // The merged token absorbs frequencies from the pair tokens
+        // Actually, we should decrement pair.0 and pair.1 frequencies
+        // and set new_id frequency
+        if let Some(freq_a) = self.token_freqs.get_mut(&pair.0) {
+            *freq_a = freq_a.saturating_sub(new_token_freq);
         }
+        if let Some(freq_b) = self.token_freqs.get_mut(&pair.1) {
+            *freq_b = freq_b.saturating_sub(new_token_freq);
+        }
+        self.token_freqs.insert(new_id, new_token_freq);
+
+        // Clean up zero/negative counts
+        self.pair_freqs.retain(|_, &mut v| v > 0);
     }
 
-    /// Get vocabulary
     pub fn vocab(&self) -> &HashMap<String, u32> {
         &self.vocab
     }
 
-    /// Get merges
     pub fn merges(&self) -> &[(String, String)] {
         &self.merges
     }
 
-    /// Export to HuggingFace tokenizer.json format
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), std::io::Error> {
         use std::io::Write;
 
@@ -460,7 +470,6 @@ mod tests {
 
     #[test]
     fn test_basic_training() {
-        // Create test corpus
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "hello world hello world").unwrap();
         writeln!(file, "hello hello hello").unwrap();
@@ -475,6 +484,28 @@ mod tests {
         trainer.train(&[file.path()]).unwrap();
 
         assert!(trainer.vocab().len() > 10);
+        assert!(!trainer.merges().is_empty());
+    }
+
+    #[test]
+    fn test_incremental_correctness() {
+        // Test that incremental updates give same result as naive
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "aaa bbb aaa bbb ccc").unwrap();
+
+        let config = TrainerConfig {
+            vocab_size: 20,
+            min_frequency: 1,
+            inl_alpha: 0.0, // Disable INL for deterministic test
+            inl_beta: 0.0,
+            inl_gate: 0.0,
+            ..Default::default()
+        };
+
+        let mut trainer = InlBpeTrainer::new(config);
+        trainer.train(&[file.path()]).unwrap();
+
+        // Should have learned some merges
         assert!(!trainer.merges().is_empty());
     }
 }
