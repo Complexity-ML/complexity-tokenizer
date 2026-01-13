@@ -26,7 +26,7 @@ use std::collections::HashMap as StdHashMap;
 fn complexity_tokenizer(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyTrainer>()?;
-    m.add("__version__", "0.1.4")?;
+    m.add("__version__", "0.1.5")?;
     Ok(())
 }
 
@@ -159,6 +159,12 @@ impl PyTrainer {
         let paths: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
         self.inner.train(&paths)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
+    }
+
+    /// Train tokenizer from an iterator of text strings (for streaming datasets)
+    fn train_from_iterator(&mut self, texts: Vec<String>) -> PyResult<()> {
+        self.inner.train_from_texts(texts.iter().map(|s| s.as_str()));
+        Ok(())
     }
 
     /// Save trained tokenizer to file (HuggingFace format)

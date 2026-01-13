@@ -12,13 +12,14 @@ Example:
     Hello world!
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Iterator, Iterable
 
 # Import from Rust extension
 from .complexity_tokenizer import Tokenizer as _Tokenizer
+from .complexity_tokenizer import Trainer as _Trainer
 from .complexity_tokenizer import __version__
 
-__all__ = ["Tokenizer", "__version__"]
+__all__ = ["Tokenizer", "Trainer", "__version__"]
 
 
 class Tokenizer(_Tokenizer):
@@ -162,3 +163,64 @@ class Tokenizer(_Tokenizer):
     def special_tokens(self) -> Dict[str, int]:
         """Get special tokens mapping."""
         return super().special_tokens
+
+
+class Trainer(_Trainer):
+    """
+    INL-BPE Trainer with dynamics-based merge selection.
+
+    Unlike standard BPE which only uses frequency, this trainer uses
+    INL dynamics to balance the vocabulary distribution.
+
+    Example:
+        >>> from complexity_tokenizer import Trainer
+        >>> trainer = Trainer(vocab_size=32000)
+        >>> trainer.train_from_iterator(texts)
+        >>> trainer.save("tokenizer.json")
+    """
+
+    def train(self, files: List[str]) -> None:
+        """
+        Train tokenizer from text files.
+
+        Args:
+            files: List of paths to text files.
+        """
+        super().train(files)
+
+    def train_from_iterator(self, texts: Iterable[str]) -> None:
+        """
+        Train tokenizer from an iterator of text strings.
+
+        This is the recommended method for streaming datasets
+        (e.g., HuggingFace datasets with streaming=True).
+
+        Args:
+            texts: Iterable of text strings.
+
+        Example:
+            >>> from datasets import load_dataset
+            >>> ds = load_dataset("HuggingFaceFW/fineweb-edu", streaming=True)
+            >>> trainer.train_from_iterator(row["text"] for row in ds["train"])
+        """
+        # Convert iterator to list (required by Rust binding)
+        super().train_from_iterator(list(texts))
+
+    def save(self, path: str) -> None:
+        """
+        Save trained tokenizer to file in HuggingFace format.
+
+        Args:
+            path: Output path for tokenizer.json.
+        """
+        super().save(path)
+
+    @property
+    def vocab_size(self) -> int:
+        """Get current vocabulary size."""
+        return super().vocab_size
+
+    @property
+    def num_merges(self) -> int:
+        """Get number of learned merges."""
+        return super().num_merges

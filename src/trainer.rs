@@ -90,6 +90,26 @@ impl InlBpeTrainer {
         let word_freqs = self.count_words(files)?;
         println!("  Found {} unique words", word_freqs.len());
 
+        self.train_from_word_freqs(word_freqs);
+        Ok(())
+    }
+
+    /// Train tokenizer from an iterator of text strings (for streaming)
+    pub fn train_from_texts<I, S>(&mut self, texts: I)
+    where
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    {
+        // Step 1: Count word frequencies from iterator
+        println!("Step 1: Counting word frequencies from iterator...");
+        let word_freqs = self.count_words_from_iter(texts);
+        println!("  Found {} unique words", word_freqs.len());
+
+        self.train_from_word_freqs(word_freqs);
+    }
+
+    /// Internal: train from pre-computed word frequencies
+    fn train_from_word_freqs(&mut self, word_freqs: HashMap<String, u32>) {
         // Step 2: Initialize vocab with characters
         println!("Step 2: Initializing character vocabulary...");
         self.init_vocab(&word_freqs);
@@ -100,8 +120,27 @@ impl InlBpeTrainer {
         self.learn_merges(&word_freqs);
         println!("  Final vocab size: {}", self.vocab.len());
         println!("  Total merges: {}", self.merges.len());
+    }
 
-        Ok(())
+    /// Count word frequencies from an iterator of texts
+    fn count_words_from_iter<I, S>(&self, texts: I) -> HashMap<String, u32>
+    where
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut word_freqs: HashMap<String, u32> = HashMap::new();
+
+        for text in texts {
+            for word in text.as_ref().split_whitespace() {
+                if word.chars().count() >= self.config.min_word_length {
+                    *word_freqs.entry(word.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Filter by minimum frequency
+        word_freqs.retain(|_, freq| *freq >= self.config.min_frequency);
+        word_freqs
     }
 
     /// Count word frequencies from files
