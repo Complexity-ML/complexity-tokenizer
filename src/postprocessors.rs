@@ -208,7 +208,7 @@ pub enum TruncationStrategy {
 /// Truncate sequences to max length
 pub fn truncate(
     ids: &mut Vec<u32>,
-    pair_ids: Option<&mut Vec<u32>>,
+    mut pair_ids: Option<&mut Vec<u32>>,
     max_length: usize,
     strategy: TruncationStrategy,
 ) {
