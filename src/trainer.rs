@@ -452,46 +452,66 @@ impl InlBpeTrainer {
         }
     }
 
-    /// Apply merge with incremental pair frequency updates
+    /// Apply merge with PARALLEL incremental pair frequency updates
     fn apply_merge_incremental(&mut self, words: &mut Vec<Word>, pair: (u32, u32), new_id: u32) {
         self.pair_freqs.remove(&pair);
 
-        let mut new_token_freq: u64 = 0;
+        // Parallel: apply merges and collect frequency deltas
+        let results: Vec<(HashMap<(u32, u32), i64>, u64)> = words
+            .par_iter_mut()
+            .map(|word| {
+                let mut deltas: HashMap<(u32, u32), i64> = HashMap::new();
+                let mut token_freq: u64 = 0;
 
-        for word in words.iter_mut() {
-            let mut i = 0;
-            while i < word.tokens.len().saturating_sub(1) {
-                if word.tokens[i] == pair.0 && word.tokens[i + 1] == pair.1 {
-                    let freq = word.freq as i64;
+                let mut i = 0;
+                while i < word.tokens.len().saturating_sub(1) {
+                    if word.tokens[i] == pair.0 && word.tokens[i + 1] == pair.1 {
+                        let freq = word.freq as i64;
 
-                    if i > 0 {
-                        let left_pair = (word.tokens[i - 1], pair.0);
-                        *self.pair_freqs.entry(left_pair).or_insert(0) -= freq;
+                        // Record decrements for old pairs
+                        if i > 0 {
+                            let left_pair = (word.tokens[i - 1], pair.0);
+                            *deltas.entry(left_pair).or_insert(0) -= freq;
+                        }
+                        if i + 2 < word.tokens.len() {
+                            let right_pair = (pair.1, word.tokens[i + 2]);
+                            *deltas.entry(right_pair).or_insert(0) -= freq;
+                        }
+
+                        // Apply merge
+                        word.tokens[i] = new_id;
+                        word.tokens.remove(i + 1);
+
+                        // Record increments for new pairs
+                        if i > 0 {
+                            let new_left = (word.tokens[i - 1], new_id);
+                            *deltas.entry(new_left).or_insert(0) += freq;
+                        }
+                        if i + 1 < word.tokens.len() {
+                            let new_right = (new_id, word.tokens[i + 1]);
+                            *deltas.entry(new_right).or_insert(0) += freq;
+                        }
+
+                        token_freq += word.freq as u64;
+                    } else {
+                        i += 1;
                     }
-                    if i + 2 < word.tokens.len() {
-                        let right_pair = (pair.1, word.tokens[i + 2]);
-                        *self.pair_freqs.entry(right_pair).or_insert(0) -= freq;
-                    }
-
-                    word.tokens[i] = new_id;
-                    word.tokens.remove(i + 1);
-
-                    if i > 0 {
-                        let new_left = (word.tokens[i - 1], new_id);
-                        *self.pair_freqs.entry(new_left).or_insert(0) += freq;
-                    }
-                    if i + 1 < word.tokens.len() {
-                        let new_right = (new_id, word.tokens[i + 1]);
-                        *self.pair_freqs.entry(new_right).or_insert(0) += freq;
-                    }
-
-                    new_token_freq += word.freq as u64;
-                } else {
-                    i += 1;
                 }
+
+                (deltas, token_freq)
+            })
+            .collect();
+
+        // Aggregate deltas (sequential but fast)
+        let mut new_token_freq: u64 = 0;
+        for (deltas, freq) in results {
+            new_token_freq += freq;
+            for (pair_key, delta) in deltas {
+                *self.pair_freqs.entry(pair_key).or_insert(0) += delta;
             }
         }
 
+        // Update token frequencies
         if let Some(freq_a) = self.token_freqs.get_mut(&pair.0) {
             *freq_a = freq_a.saturating_sub(new_token_freq);
         }
@@ -500,6 +520,7 @@ impl InlBpeTrainer {
         }
         self.token_freqs.insert(new_id, new_token_freq);
 
+        // Clean up zero/negative counts
         self.pair_freqs.retain(|_, &mut v| v > 0);
     }
 
