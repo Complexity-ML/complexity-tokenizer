@@ -33,7 +33,7 @@ pub use pretokenizers::PreTokenizer;
 pub use postprocessors::{PostProcessor, TruncationStrategy, PaddingStrategy};
 pub use decoders::Decoder;
 pub use encoding::{Encoding, AddedToken};
-pub use models::{WordPieceModel, UnigramModel, WordLevelModel, CharBpeModel, Model};
+pub use models::{WordPieceModel, UnigramModel, WordLevelModel, CharBpeModel, ByteLevelBpeModel, Model};
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -55,7 +55,8 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyUnigramModel>()?;
     m.add_class::<PyWordLevelModel>()?;
     m.add_class::<PyCharBpeModel>()?;
-    m.add("__version__", "0.2.6")?;
+    m.add_class::<PyByteLevelBpeModel>()?;
+    m.add("__version__", "0.2.7")?;
     Ok(())
 }
 
@@ -135,6 +136,12 @@ impl PyTokenizer {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
     }
 
+    /// Save tokenizer to directory (HuggingFace pretrained format)
+    fn save_pretrained(&self, dir: &str) -> PyResult<()> {
+        self.inner.save_pretrained(dir)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
+    }
+
     /// Encode text to full Encoding (with attention mask, type ids, etc.)
     fn encode_to_encoding(&self, text: &str) -> PyEncoding {
         PyEncoding {
@@ -178,6 +185,38 @@ impl PyTokenizer {
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         self.inner.encode_batch_pairs_to_encoding(&refs)
+            .into_iter()
+            .map(|e| PyEncoding { inner: e })
+            .collect()
+    }
+
+    /// Encode batch with automatic padding to longest sequence
+    #[pyo3(signature = (texts, max_length = None, pad_left = false))]
+    fn encode_batch_with_padding(
+        &self,
+        texts: Vec<String>,
+        max_length: Option<usize>,
+        pad_left: bool,
+    ) -> Vec<PyEncoding> {
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        self.inner.encode_batch_with_padding(&refs, max_length, pad_left)
+            .into_iter()
+            .map(|e| PyEncoding { inner: e })
+            .collect()
+    }
+
+    /// Encode batch of pairs with automatic padding
+    #[pyo3(signature = (pairs, max_length = None, pad_left = false))]
+    fn encode_batch_pairs_with_padding(
+        &self,
+        pairs: Vec<(String, String)>,
+        max_length: Option<usize>,
+        pad_left: bool,
+    ) -> Vec<PyEncoding> {
+        let refs: Vec<(&str, &str)> = pairs.iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        self.inner.encode_batch_pairs_with_padding(&refs, max_length, pad_left)
             .into_iter()
             .map(|e| PyEncoding { inner: e })
             .collect()
@@ -402,6 +441,37 @@ impl PyEncoding {
     /// Truncate with stride (for long documents with overlap)
     fn truncate_with_stride(&mut self, max_length: usize, stride: usize) {
         self.inner.truncate_with_stride(max_length, stride);
+    }
+
+    /// Get sequence IDs (None for special tokens, 0 for first seq, 1 for second)
+    #[getter]
+    fn sequence_ids(&self) -> Vec<Option<usize>> {
+        self.inner.sequence_ids.clone()
+    }
+
+    /// Get the token index for a character position
+    fn char_to_token(&self, char_pos: usize) -> Option<usize> {
+        self.inner.char_to_token(char_pos)
+    }
+
+    /// Get the token index for a character position within a specific sequence
+    fn char_to_token_with_sequence(&self, char_pos: usize, sequence_id: usize) -> Option<usize> {
+        self.inner.char_to_token_with_sequence(char_pos, sequence_id)
+    }
+
+    /// Get the character span for a token index (start, end)
+    fn token_to_chars(&self, token_idx: usize) -> Option<(usize, usize)> {
+        self.inner.token_to_chars(token_idx)
+    }
+
+    /// Get the word index for a token
+    fn token_to_word(&self, token_idx: usize) -> Option<usize> {
+        self.inner.token_to_word(token_idx)
+    }
+
+    /// Get the sequence ID for a token
+    fn token_to_sequence(&self, token_idx: usize) -> Option<usize> {
+        self.inner.token_to_sequence(token_idx)
     }
 }
 
@@ -828,6 +898,60 @@ impl PyCharBpeModel {
         let vocab_hash: hashbrown::HashMap<String, u32> = vocab.into_iter().collect();
         Self {
             inner: CharBpeModel::new(vocab_hash, merges, end_of_word_suffix, unk_token),
+        }
+    }
+
+    /// Encode text to token IDs
+    fn encode(&self, text: &str) -> Vec<u32> {
+        self.inner.encode(text)
+    }
+
+    /// Decode token IDs to text
+    fn decode(&self, ids: Vec<u32>) -> String {
+        self.inner.decode(&ids)
+    }
+
+    /// Get vocabulary size
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    /// Token to ID
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    /// ID to token
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id).map(|s| s.to_string())
+    }
+}
+
+// =============================================================================
+// ByteLevel BPE Model Python Bindings
+// =============================================================================
+
+/// Python-exposed ByteLevel BPE model class (GPT-2/GPT-3/LLaMA style)
+#[pyclass(name = "ByteLevelBpeModel")]
+pub struct PyByteLevelBpeModel {
+    inner: ByteLevelBpeModel,
+}
+
+#[pymethods]
+impl PyByteLevelBpeModel {
+    /// Create new ByteLevel BPE model
+    #[new]
+    #[pyo3(signature = (vocab, merges, unk_token = "<unk>".to_string(), add_prefix_space = true))]
+    fn new(
+        vocab: StdHashMap<String, u32>,
+        merges: Vec<(String, String)>,
+        unk_token: String,
+        add_prefix_space: bool,
+    ) -> Self {
+        let vocab_hash: hashbrown::HashMap<String, u32> = vocab.into_iter().collect();
+        Self {
+            inner: ByteLevelBpeModel::new(vocab_hash, merges, unk_token, add_prefix_space),
         }
     }
 

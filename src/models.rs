@@ -362,6 +362,233 @@ impl WordLevelModel {
 }
 
 // =============================================================================
+// Byte-Level BPE Model (GPT-2/GPT-3/LLaMA style)
+// =============================================================================
+
+/// GPT-2 byte-to-unicode mapping
+fn bytes_to_unicode() -> HashMap<u8, char> {
+    let mut bs: Vec<u8> = Vec::new();
+    bs.extend(b'!'..=b'~');
+    bs.extend(0xa1u8..=0xacu8);
+    bs.extend(0xaeu8..=0xffu8);
+
+    let mut cs: Vec<u32> = bs.iter().map(|&b| b as u32).collect();
+    let mut n = 0u32;
+
+    for b in 0u8..=255u8 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push(256 + n);
+            n += 1;
+        }
+    }
+
+    bs.iter()
+        .zip(cs.iter())
+        .map(|(&b, &c)| (b, char::from_u32(c).unwrap()))
+        .collect()
+}
+
+/// Reverse mapping: unicode char -> byte
+fn unicode_to_bytes() -> HashMap<char, u8> {
+    bytes_to_unicode()
+        .into_iter()
+        .map(|(b, c)| (c, b))
+        .collect()
+}
+
+/// Byte-Level BPE tokenizer (GPT-2/GPT-3/LLaMA style)
+#[derive(Debug, Clone)]
+pub struct ByteLevelBpeModel {
+    /// Token string -> ID
+    vocab: HashMap<String, u32>,
+    /// ID -> Token string
+    vocab_r: HashMap<u32, String>,
+    /// Merge operations: (pair_a, pair_b) -> merged
+    merges: Vec<((String, String), String)>,
+    /// Merge priority: (pair_a, pair_b) -> rank
+    merge_ranks: HashMap<(String, String), usize>,
+    /// Byte encoder
+    byte_encoder: HashMap<u8, char>,
+    /// Byte decoder
+    byte_decoder: HashMap<char, u8>,
+    /// Unknown token
+    unk_token: String,
+    /// Add prefix space
+    add_prefix_space: bool,
+}
+
+impl ByteLevelBpeModel {
+    /// Create new Byte-Level BPE model
+    pub fn new(
+        vocab: HashMap<String, u32>,
+        merges: Vec<(String, String)>,
+        unk_token: String,
+        add_prefix_space: bool,
+    ) -> Self {
+        let vocab_r: HashMap<u32, String> = vocab.iter()
+            .map(|(k, v)| (*v, k.clone()))
+            .collect();
+
+        let mut merge_ops = Vec::new();
+        let mut merge_ranks = HashMap::new();
+
+        for (rank, (a, b)) in merges.iter().enumerate() {
+            let merged = format!("{}{}", a, b);
+            merge_ops.push(((a.clone(), b.clone()), merged));
+            merge_ranks.insert((a.clone(), b.clone()), rank);
+        }
+
+        Self {
+            vocab,
+            vocab_r,
+            merges: merge_ops,
+            merge_ranks,
+            byte_encoder: bytes_to_unicode(),
+            byte_decoder: unicode_to_bytes(),
+            unk_token,
+            add_prefix_space,
+        }
+    }
+
+    /// Convert text to byte-level tokens
+    fn text_to_byte_tokens(&self, text: &str) -> String {
+        text.bytes()
+            .filter_map(|b| self.byte_encoder.get(&b).copied())
+            .collect()
+    }
+
+    /// Convert byte-level tokens back to text
+    fn byte_tokens_to_text(&self, tokens: &str) -> String {
+        let bytes: Vec<u8> = tokens
+            .chars()
+            .filter_map(|c| self.byte_decoder.get(&c).copied())
+            .collect();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// Tokenize a single word using BPE
+    fn tokenize_word(&self, word: &str) -> Vec<String> {
+        if word.is_empty() {
+            return vec![];
+        }
+
+        // Convert to byte-level representation
+        let byte_word = self.text_to_byte_tokens(word);
+
+        // Start with individual characters
+        let mut tokens: Vec<String> = byte_word.chars().map(|c| c.to_string()).collect();
+
+        if tokens.is_empty() {
+            return vec![];
+        }
+
+        // Apply BPE merges
+        loop {
+            let mut best_merge: Option<(usize, usize, String)> = None;
+
+            for i in 0..tokens.len().saturating_sub(1) {
+                let pair = (tokens[i].clone(), tokens[i + 1].clone());
+                if let Some(&rank) = self.merge_ranks.get(&pair) {
+                    match &best_merge {
+                        None => {
+                            let merged = format!("{}{}", pair.0, pair.1);
+                            best_merge = Some((i, rank, merged));
+                        }
+                        Some((_, best_rank, _)) if rank < *best_rank => {
+                            let merged = format!("{}{}", pair.0, pair.1);
+                            best_merge = Some((i, rank, merged));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            match best_merge {
+                Some((idx, _, merged)) => {
+                    tokens[idx] = merged;
+                    tokens.remove(idx + 1);
+                }
+                None => break,
+            }
+        }
+
+        tokens
+    }
+
+    /// Encode text to token IDs
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        let unk_id = self.vocab.get(&self.unk_token).copied().unwrap_or(0);
+
+        let text = if self.add_prefix_space && !text.starts_with(' ') {
+            format!(" {}", text)
+        } else {
+            text.to_string()
+        };
+
+        // Split on whitespace but keep spaces attached to following word
+        let mut result = Vec::new();
+        let mut current_word = String::new();
+
+        for c in text.chars() {
+            if c == ' ' {
+                if !current_word.is_empty() {
+                    // Tokenize previous word
+                    for token in self.tokenize_word(&current_word) {
+                        result.push(self.vocab.get(&token).copied().unwrap_or(unk_id));
+                    }
+                    current_word.clear();
+                }
+                // Start new word with space (Ġ in byte-level)
+                current_word.push(c);
+            } else {
+                current_word.push(c);
+            }
+        }
+
+        // Don't forget the last word
+        if !current_word.is_empty() {
+            for token in self.tokenize_word(&current_word) {
+                result.push(self.vocab.get(&token).copied().unwrap_or(unk_id));
+            }
+        }
+
+        result
+    }
+
+    /// Decode token IDs to text
+    pub fn decode(&self, ids: &[u32]) -> String {
+        let tokens: String = ids
+            .iter()
+            .filter_map(|&id| self.vocab_r.get(&id))
+            .cloned()
+            .collect();
+
+        self.byte_tokens_to_text(&tokens)
+    }
+
+    /// Get vocabulary size
+    pub fn vocab_size(&self) -> usize {
+        self.vocab.len()
+    }
+
+    /// Token to ID
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.vocab.get(token).copied()
+    }
+
+    /// ID to token
+    pub fn id_to_token(&self, id: u32) -> Option<&str> {
+        self.vocab_r.get(&id).map(|s| s.as_str())
+    }
+
+    /// Get vocab reference
+    pub fn vocab(&self) -> &HashMap<String, u32> {
+        &self.vocab
+    }
+}
+
+// =============================================================================
 // CharBPE Model (character-level BPE with word boundary markers)
 // =============================================================================
 
@@ -522,6 +749,8 @@ impl CharBpeModel {
 pub enum Model {
     /// BPE model (existing)
     BPE,
+    /// ByteLevel BPE model (GPT-2/GPT-3/LLaMA style)
+    ByteLevelBPE(ByteLevelBpeModel),
     /// CharBPE model (original GPT-style)
     CharBPE(CharBpeModel),
     /// WordPiece model (BERT)
@@ -533,6 +762,21 @@ pub enum Model {
 }
 
 impl Model {
+    /// Create ByteLevel BPE model (GPT-2 style)
+    pub fn byte_level_bpe(
+        vocab: HashMap<String, u32>,
+        merges: Vec<(String, String)>,
+        unk_token: &str,
+        add_prefix_space: bool,
+    ) -> Self {
+        Model::ByteLevelBPE(ByteLevelBpeModel::new(
+            vocab,
+            merges,
+            unk_token.to_string(),
+            add_prefix_space,
+        ))
+    }
+
     /// Create CharBPE model
     pub fn char_bpe(
         vocab: HashMap<String, u32>,
@@ -680,5 +924,47 @@ mod tests {
 
         let decoded = model.decode(&tokens);
         assert_eq!(decoded, "hi");
+    }
+
+    #[test]
+    fn test_byte_level_bpe() {
+        let mut vocab = HashMap::new();
+        vocab.insert("<unk>".to_string(), 0);
+        vocab.insert("Ġ".to_string(), 1);  // space in byte-level
+        vocab.insert("h".to_string(), 2);
+        vocab.insert("i".to_string(), 3);
+        vocab.insert("Ġh".to_string(), 4);
+        vocab.insert("hi".to_string(), 5);
+        vocab.insert("Ġhi".to_string(), 6);
+
+        let merges = vec![
+            ("Ġ".to_string(), "h".to_string()),
+            ("h".to_string(), "i".to_string()),
+            ("Ġh".to_string(), "i".to_string()),
+        ];
+
+        let model = ByteLevelBpeModel::new(vocab, merges, "<unk>".to_string(), true);
+
+        let tokens = model.encode("hi");
+        assert!(!tokens.is_empty());
+
+        let decoded = model.decode(&tokens);
+        assert!(decoded.contains("hi"));
+    }
+
+    #[test]
+    fn test_byte_level_mapping() {
+        let encoder = bytes_to_unicode();
+        let decoder = unicode_to_bytes();
+
+        // Test that space (0x20) maps to 'Ġ' (U+0120)
+        assert_eq!(encoder.get(&b' '), Some(&'Ġ'));
+
+        // Test round-trip
+        for b in 0u8..=255 {
+            if let Some(&c) = encoder.get(&b) {
+                assert_eq!(decoder.get(&c), Some(&b));
+            }
+        }
     }
 }

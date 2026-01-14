@@ -282,6 +282,7 @@ impl HuggingFaceTokenizer {
             special_tokens_mask: vec![0; len],
             offsets,
             word_ids,
+            sequence_ids: vec![Some(type_id as usize); len],
             overflowing: Vec::new(),
         }
     }
@@ -296,6 +297,67 @@ impl HuggingFaceTokenizer {
         pairs.par_iter()
             .map(|(a, b)| self.encode_pair_to_encoding(a, b))
             .collect()
+    }
+
+    /// Encode batch with automatic padding to longest sequence
+    pub fn encode_batch_with_padding(
+        &self,
+        texts: &[&str],
+        pad_to_max: Option<usize>,
+        pad_left: bool,
+    ) -> Vec<Encoding> {
+        let mut encodings: Vec<Encoding> = texts.par_iter()
+            .map(|t| self.encode_to_encoding(t))
+            .collect();
+
+        // Find max length
+        let max_len = pad_to_max.unwrap_or_else(|| {
+            encodings.iter().map(|e| e.len()).max().unwrap_or(0)
+        });
+
+        // Get pad token ID
+        let pad_id = self.special_tokens.get("[PAD]")
+            .or_else(|| self.special_tokens.get("<pad>"))
+            .copied()
+            .unwrap_or(0);
+
+        let pad_token = self.vocab.get_token(pad_id).unwrap_or("<pad>");
+
+        // Pad all sequences
+        for enc in &mut encodings {
+            enc.pad(max_len, pad_id, pad_token, pad_left);
+        }
+
+        encodings
+    }
+
+    /// Encode batch of pairs with automatic padding
+    pub fn encode_batch_pairs_with_padding(
+        &self,
+        pairs: &[(&str, &str)],
+        pad_to_max: Option<usize>,
+        pad_left: bool,
+    ) -> Vec<Encoding> {
+        let mut encodings: Vec<Encoding> = pairs.par_iter()
+            .map(|(a, b)| self.encode_pair_to_encoding(a, b))
+            .collect();
+
+        let max_len = pad_to_max.unwrap_or_else(|| {
+            encodings.iter().map(|e| e.len()).max().unwrap_or(0)
+        });
+
+        let pad_id = self.special_tokens.get("[PAD]")
+            .or_else(|| self.special_tokens.get("<pad>"))
+            .copied()
+            .unwrap_or(0);
+
+        let pad_token = self.vocab.get_token(pad_id).unwrap_or("<pad>");
+
+        for enc in &mut encodings {
+            enc.pad(max_len, pad_id, pad_token, pad_left);
+        }
+
+        encodings
     }
 
     /// Add a token dynamically
@@ -421,8 +483,15 @@ impl HuggingFaceTokenizer {
     pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let vocab = self.bpe.vocab().clone();
 
-        // Reconstruct merges (we don't store them, so this is limited)
-        let merges: Vec<String> = Vec::new();
+        // Reconstruct merges from BPE
+        let merges: Vec<String> = self.bpe.merges()
+            .iter()
+            .map(|m| {
+                let a = self.bpe.vocab_r().get(&m.pair.0).cloned().unwrap_or_default();
+                let b = self.bpe.vocab_r().get(&m.pair.1).cloned().unwrap_or_default();
+                format!("{} {}", a, b)
+            })
+            .collect();
 
         let added_tokens: Vec<AddedToken> = self
             .added_tokens
@@ -446,16 +515,61 @@ impl HuggingFaceTokenizer {
                 merges,
             },
             added_tokens,
-            normalizer: None,
-            pre_tokenizer: None,
-            post_processor: None,
-            decoder: None,
+            normalizer: self.normalizer.as_ref().map(serialize_normalizer),
+            pre_tokenizer: self.pre_tokenizer.as_ref().map(serialize_pre_tokenizer),
+            post_processor: self.post_processor.as_ref().map(|pp| serialize_post_processor(pp, &self.special_tokens)),
+            decoder: self.decoder.as_ref().map(serialize_decoder),
         };
 
         let json = serde_json::to_string_pretty(&tokenizer_json)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         fs::write(path, json)
+    }
+
+    /// Save tokenizer to a directory (HuggingFace pretrained format)
+    pub fn save_pretrained<P: AsRef<Path>>(&self, dir: P) -> io::Result<()> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir)?;
+
+        // Save tokenizer.json
+        self.save(dir.join("tokenizer.json"))?;
+
+        // Save tokenizer_config.json
+        let config = serde_json::json!({
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "model_type": "bpe",
+            "bos_token": self.vocab.special_tokens().bos_token,
+            "eos_token": self.vocab.special_tokens().eos_token,
+            "unk_token": self.vocab.special_tokens().unk_token,
+            "pad_token": self.vocab.special_tokens().pad_token,
+            "sep_token": self.vocab.special_tokens().sep_token,
+            "cls_token": self.vocab.special_tokens().cls_token,
+            "mask_token": self.vocab.special_tokens().mask_token,
+        });
+
+        let config_json = serde_json::to_string_pretty(&config)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        fs::write(dir.join("tokenizer_config.json"), config_json)?;
+
+        // Save special_tokens_map.json
+        let special_map = serde_json::json!({
+            "bos_token": self.vocab.special_tokens().bos_token,
+            "eos_token": self.vocab.special_tokens().eos_token,
+            "unk_token": self.vocab.special_tokens().unk_token,
+            "pad_token": self.vocab.special_tokens().pad_token,
+            "sep_token": self.vocab.special_tokens().sep_token,
+            "cls_token": self.vocab.special_tokens().cls_token,
+            "mask_token": self.vocab.special_tokens().mask_token,
+        });
+
+        let special_json = serde_json::to_string_pretty(&special_map)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        fs::write(dir.join("special_tokens_map.json"), special_json)?;
+
+        Ok(())
     }
 }
 
@@ -662,6 +776,158 @@ fn template_from_array(arr: &[serde_json::Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+// =============================================================================
+// Serialization Helpers
+// =============================================================================
+
+/// Serialize normalizer to JSON
+fn serialize_normalizer(normalizer: &Normalizer) -> serde_json::Value {
+    match normalizer {
+        Normalizer::NFC => serde_json::json!({"type": "NFC"}),
+        Normalizer::NFD => serde_json::json!({"type": "NFD"}),
+        Normalizer::NFKC => serde_json::json!({"type": "NFKC"}),
+        Normalizer::NFKD => serde_json::json!({"type": "NFKD"}),
+        Normalizer::Lowercase => serde_json::json!({"type": "Lowercase"}),
+        Normalizer::Strip => serde_json::json!({"type": "Strip"}),
+        Normalizer::StripAccents => serde_json::json!({"type": "StripAccents"}),
+        Normalizer::Replace { pattern, replacement } => serde_json::json!({
+            "type": "Replace",
+            "pattern": {"String": pattern},
+            "content": replacement
+        }),
+        Normalizer::Prepend(prepend) => serde_json::json!({
+            "type": "Prepend",
+            "prepend": prepend
+        }),
+        Normalizer::Append(append) => serde_json::json!({
+            "type": "Append",
+            "append": append
+        }),
+        Normalizer::Sequence(normalizers) => serde_json::json!({
+            "type": "Sequence",
+            "normalizers": normalizers.iter().map(serialize_normalizer).collect::<Vec<_>>()
+        }),
+    }
+}
+
+/// Serialize pre-tokenizer to JSON
+fn serialize_pre_tokenizer(pre_tokenizer: &PreTokenizer) -> serde_json::Value {
+    match pre_tokenizer {
+        PreTokenizer::ByteLevel { add_prefix_space } => serde_json::json!({
+            "type": "ByteLevel",
+            "add_prefix_space": add_prefix_space,
+            "trim_offsets": true,
+            "use_regex": true
+        }),
+        PreTokenizer::Metaspace { replacement, add_prefix_space } => serde_json::json!({
+            "type": "Metaspace",
+            "replacement": replacement.to_string(),
+            "add_prefix_space": add_prefix_space
+        }),
+        PreTokenizer::Whitespace => serde_json::json!({"type": "Whitespace"}),
+        PreTokenizer::WhitespaceSplit => serde_json::json!({"type": "WhitespaceSplit"}),
+        PreTokenizer::Punctuation => serde_json::json!({"type": "Punctuation"}),
+        PreTokenizer::Digits { individual_digits } => serde_json::json!({
+            "type": "Digits",
+            "individual_digits": individual_digits
+        }),
+        PreTokenizer::Split { pattern, invert } => serde_json::json!({
+            "type": "Split",
+            "pattern": {"Regex": pattern},
+            "behavior": "Removed",
+            "invert": invert
+        }),
+        PreTokenizer::GPT2 => serde_json::json!({
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "trim_offsets": true,
+            "use_regex": true
+        }),
+        PreTokenizer::Sequence(pretokenizers) => serde_json::json!({
+            "type": "Sequence",
+            "pretokenizers": pretokenizers.iter().map(serialize_pre_tokenizer).collect::<Vec<_>>()
+        }),
+    }
+}
+
+/// Serialize post-processor to JSON
+fn serialize_post_processor(post_processor: &PostProcessor, special_tokens: &HashMap<String, u32>) -> serde_json::Value {
+    match post_processor {
+        PostProcessor::TemplateProcessing { single, pair, special_tokens: tokens } => {
+            let special_tokens_json: Vec<serde_json::Value> = tokens.iter()
+                .map(|(token, id)| serde_json::json!({
+                    "id": token,
+                    "ids": [id],
+                    "tokens": [token]
+                }))
+                .collect();
+
+            serde_json::json!({
+                "type": "TemplateProcessing",
+                "single": parse_template_to_json(single),
+                "pair": pair.as_ref().map(|p| parse_template_to_json(p)),
+                "special_tokens": special_tokens_json
+            })
+        }
+        PostProcessor::RobertaProcessing { bos, eos, add_prefix_space } => serde_json::json!({
+            "type": "RobertaProcessing",
+            "sep": [eos.0.clone(), eos.1],
+            "cls": [bos.0.clone(), bos.1],
+            "trim_offsets": true,
+            "add_prefix_space": add_prefix_space
+        }),
+        PostProcessor::BertProcessing { cls, sep } => serde_json::json!({
+            "type": "BertProcessing",
+            "sep": [sep.0.clone(), sep.1],
+            "cls": [cls.0.clone(), cls.1]
+        }),
+        _ => serde_json::json!(null),
+    }
+}
+
+/// Parse template string to JSON array
+fn parse_template_to_json(template: &str) -> Vec<serde_json::Value> {
+    template.split_whitespace()
+        .map(|part| {
+            if part.starts_with('$') {
+                serde_json::json!({"Sequence": {"id": &part[1..], "type_id": 0}})
+            } else {
+                serde_json::json!({"SpecialToken": {"id": part, "type_id": 0}})
+            }
+        })
+        .collect()
+}
+
+/// Serialize decoder to JSON
+fn serialize_decoder(decoder: &Decoder) -> serde_json::Value {
+    match decoder {
+        Decoder::ByteLevel => serde_json::json!({"type": "ByteLevel"}),
+        Decoder::Metaspace { replacement, add_prefix_space } => serde_json::json!({
+            "type": "Metaspace",
+            "replacement": replacement.to_string(),
+            "add_prefix_space": add_prefix_space
+        }),
+        Decoder::WordPiece { prefix, cleanup } => serde_json::json!({
+            "type": "WordPiece",
+            "prefix": prefix,
+            "cleanup": cleanup
+        }),
+        Decoder::BPE { suffix } => serde_json::json!({
+            "type": "BPE",
+            "suffix": suffix
+        }),
+        Decoder::Replace { pattern, replacement } => serde_json::json!({
+            "type": "Replace",
+            "pattern": pattern,
+            "content": replacement
+        }),
+        Decoder::Sequence(decoders) => serde_json::json!({
+            "type": "Sequence",
+            "decoders": decoders.iter().map(serialize_decoder).collect::<Vec<_>>()
+        }),
+    }
 }
 
 /// Parse decoder from JSON

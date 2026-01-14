@@ -19,6 +19,8 @@ pub struct Encoding {
     pub offsets: Vec<(usize, usize)>,
     /// Word IDs (which word each token belongs to)
     pub word_ids: Vec<Option<usize>>,
+    /// Sequence IDs (None for special tokens, 0 for first seq, 1 for second)
+    pub sequence_ids: Vec<Option<usize>>,
     /// Overflowing tokens (if truncated)
     pub overflowing: Vec<Encoding>,
 }
@@ -34,6 +36,7 @@ impl Encoding {
             special_tokens_mask: Vec::new(),
             offsets: Vec::new(),
             word_ids: Vec::new(),
+            sequence_ids: Vec::new(),
             overflowing: Vec::new(),
         }
     }
@@ -49,6 +52,7 @@ impl Encoding {
             special_tokens_mask: vec![0; len],
             offsets: Vec::new(),
             word_ids: Vec::new(),
+            sequence_ids: vec![Some(0); len],
             overflowing: Vec::new(),
         }
     }
@@ -108,6 +112,10 @@ impl Encoding {
             let mut new_special = vec![1; pad_count];  // Padding is special
             new_special.extend(&self.special_tokens_mask);
             self.special_tokens_mask = new_special;
+
+            let mut new_seq_ids: Vec<Option<usize>> = vec![None; pad_count];
+            new_seq_ids.extend(&self.sequence_ids);
+            self.sequence_ids = new_seq_ids;
         } else {
             // Append padding
             self.ids.extend(std::iter::repeat(pad_id).take(pad_count));
@@ -115,6 +123,7 @@ impl Encoding {
             self.tokens.extend(std::iter::repeat(pad_token.to_string()).take(pad_count));
             self.attention_mask.extend(std::iter::repeat(0).take(pad_count));
             self.special_tokens_mask.extend(std::iter::repeat(1).take(pad_count));
+            self.sequence_ids.extend(std::iter::repeat(None).take(pad_count));
         }
     }
 
@@ -141,6 +150,11 @@ impl Encoding {
             } else {
                 Vec::new()
             },
+            sequence_ids: if self.sequence_ids.len() > max_length {
+                self.sequence_ids[max_length..].to_vec()
+            } else {
+                Vec::new()
+            },
             overflowing: Vec::new(),
         };
 
@@ -154,6 +168,7 @@ impl Encoding {
         self.special_tokens_mask.truncate(max_length);
         self.offsets.truncate(max_length);
         self.word_ids.truncate(max_length);
+        self.sequence_ids.truncate(max_length);
     }
 
     /// Truncate with stride - creates overlapping windows for long documents
@@ -184,6 +199,11 @@ impl Encoding {
                 } else {
                     Vec::new()
                 },
+                sequence_ids: if self.sequence_ids.len() > start {
+                    self.sequence_ids[start..end.min(self.sequence_ids.len())].to_vec()
+                } else {
+                    Vec::new()
+                },
                 overflowing: Vec::new(),
             };
 
@@ -199,6 +219,7 @@ impl Encoding {
         self.special_tokens_mask.truncate(max_length);
         self.offsets.truncate(max_length);
         self.word_ids.truncate(max_length);
+        self.sequence_ids.truncate(max_length);
     }
 
     /// Get word IDs
@@ -218,7 +239,7 @@ impl Encoding {
 
     /// Merge two encodings (for sequence pairs)
     pub fn merge(&mut self, other: Encoding, type_id: u32) {
-        let _start = self.ids.len();
+        let other_len = other.ids.len();
 
         self.ids.extend(other.ids);
         self.tokens.extend(other.tokens);
@@ -228,7 +249,54 @@ impl Encoding {
         self.word_ids.extend(other.word_ids);
 
         // Set type IDs for second sequence
-        self.type_ids.extend(std::iter::repeat(type_id).take(other.type_ids.len()));
+        self.type_ids.extend(std::iter::repeat(type_id).take(other_len));
+
+        // Set sequence IDs for second sequence
+        self.sequence_ids.extend(std::iter::repeat(Some(type_id as usize)).take(other_len));
+    }
+
+    /// Get sequence IDs
+    pub fn sequence_ids(&self) -> &[Option<usize>] {
+        &self.sequence_ids
+    }
+
+    /// Get the token index for a character position
+    /// Returns None if the character is not part of any token
+    pub fn char_to_token(&self, char_pos: usize) -> Option<usize> {
+        for (i, &(start, end)) in self.offsets.iter().enumerate() {
+            if char_pos >= start && char_pos < end {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Get the token index for a character position within a specific sequence
+    pub fn char_to_token_with_sequence(&self, char_pos: usize, sequence_id: usize) -> Option<usize> {
+        for (i, &(start, end)) in self.offsets.iter().enumerate() {
+            if let Some(seq_id) = self.sequence_ids.get(i).and_then(|s| *s) {
+                if seq_id == sequence_id && char_pos >= start && char_pos < end {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the character span for a token index
+    /// Returns (start, end) character positions
+    pub fn token_to_chars(&self, token_idx: usize) -> Option<(usize, usize)> {
+        self.offsets.get(token_idx).copied()
+    }
+
+    /// Get the word index for a token
+    pub fn token_to_word(&self, token_idx: usize) -> Option<usize> {
+        self.word_ids.get(token_idx).and_then(|w| *w)
+    }
+
+    /// Get the sequence ID for a token
+    pub fn token_to_sequence(&self, token_idx: usize) -> Option<usize> {
+        self.sequence_ids.get(token_idx).and_then(|s| *s)
     }
 }
 
@@ -310,6 +378,7 @@ mod tests {
         assert_eq!(enc.len(), 3);
         assert_eq!(enc.attention_mask, vec![1, 1, 1]);
         assert_eq!(enc.type_ids, vec![0, 0, 0]);
+        assert_eq!(enc.sequence_ids, vec![Some(0), Some(0), Some(0)]);
     }
 
     #[test]
@@ -321,6 +390,7 @@ mod tests {
         enc.pad(5, 0, "<pad>", false);
         assert_eq!(enc.len(), 5);
         assert_eq!(enc.attention_mask, vec![1, 1, 0, 0, 0]);
+        assert_eq!(enc.sequence_ids, vec![Some(0), Some(0), None, None, None]);
     }
 
     #[test]
@@ -340,5 +410,33 @@ mod tests {
         let token = AddedToken::special("<eos>").lstrip(true);
         assert!(token.special);
         assert!(token.lstrip);
+    }
+
+    #[test]
+    fn test_char_to_token() {
+        let mut enc = Encoding::from_ids(
+            vec![1, 2, 3],
+            vec!["hello".to_string(), " ".to_string(), "world".to_string()],
+        );
+        enc.offsets = vec![(0, 5), (5, 6), (6, 11)];
+
+        assert_eq!(enc.char_to_token(0), Some(0)); // 'h'
+        assert_eq!(enc.char_to_token(4), Some(0)); // 'o' in hello
+        assert_eq!(enc.char_to_token(5), Some(1)); // space
+        assert_eq!(enc.char_to_token(6), Some(2)); // 'w'
+        assert_eq!(enc.char_to_token(11), None);   // past end
+    }
+
+    #[test]
+    fn test_token_to_chars() {
+        let mut enc = Encoding::from_ids(
+            vec![1, 2],
+            vec!["hello".to_string(), "world".to_string()],
+        );
+        enc.offsets = vec![(0, 5), (5, 10)];
+
+        assert_eq!(enc.token_to_chars(0), Some((0, 5)));
+        assert_eq!(enc.token_to_chars(1), Some((5, 10)));
+        assert_eq!(enc.token_to_chars(2), None);
     }
 }

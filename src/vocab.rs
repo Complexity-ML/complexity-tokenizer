@@ -132,6 +132,11 @@ impl Vocab {
         &self.token_to_id
     }
 
+    /// Get special tokens configuration
+    pub fn special_tokens(&self) -> &SpecialTokens {
+        &self.special_tokens
+    }
+
     /// Check if token is special
     pub fn is_special_token(&self, token: &str) -> bool {
         self.special_tokens.unk_token.as_deref() == Some(token)

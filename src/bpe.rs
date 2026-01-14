@@ -200,6 +200,16 @@ impl BpeTokenizer {
     pub fn vocab(&self) -> &HashMap<String, u32> {
         &self.vocab
     }
+
+    /// Get reverse vocab reference (ID -> token)
+    pub fn vocab_r(&self) -> &HashMap<u32, String> {
+        &self.vocab_r
+    }
+
+    /// Get merges reference
+    pub fn merges(&self) -> &[Merge] {
+        &self.merges
+    }
 }
 
 #[cfg(test)]
