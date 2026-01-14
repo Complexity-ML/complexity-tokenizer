@@ -9,6 +9,7 @@
 //! - HuggingFace tokenizer.json compatibility
 //! - Full encoding with attention masks, token type IDs, offsets
 //! - Normalizers, pre-tokenizers, post-processors, decoders
+//! - Multiple model types: BPE, WordPiece, Unigram, WordLevel
 
 mod bpe;
 mod vocab;
@@ -19,6 +20,7 @@ mod pretokenizers;
 mod postprocessors;
 mod decoders;
 mod encoding;
+mod models;
 
 pub use bpe::BpeTokenizer;
 pub use vocab::Vocab;
@@ -29,6 +31,7 @@ pub use pretokenizers::PreTokenizer;
 pub use postprocessors::{PostProcessor, TruncationStrategy, PaddingStrategy};
 pub use decoders::Decoder;
 pub use encoding::{Encoding, AddedToken};
+pub use models::{WordPieceModel, UnigramModel, WordLevelModel, Model};
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -44,7 +47,10 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPreTokenizer>()?;
     m.add_class::<PyPostProcessor>()?;
     m.add_class::<PyDecoder>()?;
-    m.add("__version__", "0.2.3")?;
+    m.add_class::<PyWordPieceModel>()?;
+    m.add_class::<PyUnigramModel>()?;
+    m.add_class::<PyWordLevelModel>()?;
+    m.add("__version__", "0.2.4")?;
     Ok(())
 }
 
@@ -572,5 +578,156 @@ impl PyDecoder {
     /// Decode tokens to text
     fn decode(&self, tokens: Vec<String>) -> String {
         self.inner.decode(&tokens)
+    }
+}
+
+// =============================================================================
+// WordPiece Model Python Bindings
+// =============================================================================
+
+/// Python-exposed WordPiece model class
+#[pyclass(name = "WordPieceModel")]
+pub struct PyWordPieceModel {
+    inner: WordPieceModel,
+}
+
+#[pymethods]
+impl PyWordPieceModel {
+    /// Create new WordPiece model
+    #[new]
+    #[pyo3(signature = (vocab, prefix = "##".to_string(), unk_token = "[UNK]".to_string(), max_input_chars_per_word = 100))]
+    fn new(
+        vocab: StdHashMap<String, u32>,
+        prefix: String,
+        unk_token: String,
+        max_input_chars_per_word: usize,
+    ) -> Self {
+        let vocab_hash: hashbrown::HashMap<String, u32> = vocab.into_iter().collect();
+        Self {
+            inner: WordPieceModel::new(vocab_hash, prefix, unk_token, max_input_chars_per_word),
+        }
+    }
+
+    /// Encode text to token IDs
+    fn encode(&self, text: &str) -> Vec<u32> {
+        self.inner.encode(text)
+    }
+
+    /// Decode token IDs to text
+    fn decode(&self, ids: Vec<u32>) -> String {
+        self.inner.decode(&ids)
+    }
+
+    /// Get vocabulary size
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    /// Token to ID
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    /// ID to token
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id).map(|s| s.to_string())
+    }
+}
+
+// =============================================================================
+// Unigram Model Python Bindings
+// =============================================================================
+
+/// Python-exposed Unigram model class
+#[pyclass(name = "UnigramModel")]
+pub struct PyUnigramModel {
+    inner: UnigramModel,
+}
+
+#[pymethods]
+impl PyUnigramModel {
+    /// Create new Unigram model
+    #[new]
+    #[pyo3(signature = (vocab, unk_token = "<unk>".to_string()))]
+    fn new(vocab: Vec<(String, f64)>, unk_token: String) -> Self {
+        Self {
+            inner: UnigramModel::new(vocab, unk_token),
+        }
+    }
+
+    /// Encode text to token IDs
+    fn encode(&self, text: &str) -> Vec<u32> {
+        self.inner.encode(text)
+    }
+
+    /// Decode token IDs to text
+    fn decode(&self, ids: Vec<u32>) -> String {
+        self.inner.decode(&ids)
+    }
+
+    /// Get vocabulary size
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    /// Token to ID
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    /// ID to token
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id).map(|s| s.to_string())
+    }
+}
+
+// =============================================================================
+// WordLevel Model Python Bindings
+// =============================================================================
+
+/// Python-exposed WordLevel model class
+#[pyclass(name = "WordLevelModel")]
+pub struct PyWordLevelModel {
+    inner: WordLevelModel,
+}
+
+#[pymethods]
+impl PyWordLevelModel {
+    /// Create new WordLevel model
+    #[new]
+    #[pyo3(signature = (vocab, unk_token = "<unk>".to_string()))]
+    fn new(vocab: StdHashMap<String, u32>, unk_token: String) -> Self {
+        let vocab_hash: hashbrown::HashMap<String, u32> = vocab.into_iter().collect();
+        Self {
+            inner: WordLevelModel::new(vocab_hash, unk_token),
+        }
+    }
+
+    /// Encode text to token IDs
+    fn encode(&self, text: &str) -> Vec<u32> {
+        self.inner.encode(text)
+    }
+
+    /// Decode token IDs to text
+    fn decode(&self, ids: Vec<u32>) -> String {
+        self.inner.decode(&ids)
+    }
+
+    /// Get vocabulary size
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    /// Token to ID
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    /// ID to token
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id).map(|s| s.to_string())
     }
 }

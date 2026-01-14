@@ -2,10 +2,12 @@
 //!
 //! Key optimizations:
 //! 1. BinaryHeap for O(log n) best pair selection
-//! 2. ByteLevel pre-tokenization (like GPT-2/HuggingFace)
+//! 2. Configurable normalizer and pre-tokenizer
 //! 3. Incremental pair counting
 //! 4. Parallel word processing with rayon
 
+use crate::normalizers::Normalizer;
+use crate::pretokenizers::PreTokenizer;
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -75,6 +77,10 @@ pub struct TrainerConfig {
     pub inl_mu_target: f32,
     pub inl_velocity_max: f32,
     pub inl_beta_max: f32,
+    /// Normalizer to apply before pre-tokenization
+    pub normalizer: Option<Normalizer>,
+    /// Pre-tokenizer to split text into words
+    pub pre_tokenizer: Option<PreTokenizer>,
 }
 
 impl Default for TrainerConfig {
@@ -95,6 +101,8 @@ impl Default for TrainerConfig {
             inl_mu_target: 0.01,
             inl_velocity_max: 10.0,
             inl_beta_max: 2.0,
+            normalizer: Some(Normalizer::NFC),
+            pre_tokenizer: Some(PreTokenizer::ByteLevel { add_prefix_space: false }),
         }
     }
 }
@@ -162,9 +170,24 @@ impl InlBpeTrainer {
         }
     }
 
+    /// Pre-tokenize text using configured normalizer and pre-tokenizer
+    fn pretokenize(&self, text: &str) -> Vec<String> {
+        // Apply normalizer
+        let normalized = match &self.config.normalizer {
+            Some(n) => n.normalize(text),
+            None => text.to_string(),
+        };
+
+        // Apply pre-tokenizer
+        match &self.config.pre_tokenizer {
+            Some(pt) => pt.pre_tokenize(&normalized),
+            None => byte_level_pretokenize(&normalized, &self.byte_encoder),
+        }
+    }
+
     pub fn train<P: AsRef<Path>>(&mut self, files: &[P]) -> Result<(), std::io::Error> {
-        println!("Step 1: Counting word frequencies (ByteLevel)...");
-        let word_freqs = self.count_words_bytelevel(files)?;
+        println!("Step 1: Counting word frequencies...");
+        let word_freqs = self.count_words(files)?;
         println!("  Found {} unique words", word_freqs.len());
         self.train_from_word_freqs(word_freqs);
         Ok(())
@@ -181,14 +204,14 @@ impl InlBpeTrainer {
         self.train_from_word_freqs(word_freqs);
     }
 
-    /// Count words from a batch with ByteLevel encoding
+    /// Count words from a batch using configured normalizer/pretokenizer
     pub fn count_batch<I, S>(&mut self, texts: I)
     where
         I: Iterator<Item = S>,
         S: AsRef<str>,
     {
         for text in texts {
-            let words = byte_level_pretokenize(text.as_ref(), &self.byte_encoder);
+            let words = self.pretokenize(text.as_ref());
             for word in words {
                 if word.chars().count() >= self.config.min_word_length {
                     *self.word_freqs_accumulator.entry(word).or_insert(0) += 1;
@@ -227,7 +250,7 @@ impl InlBpeTrainer {
     {
         let mut word_freqs: HashMap<String, u32> = HashMap::new();
         for text in texts {
-            let words = byte_level_pretokenize(text.as_ref(), &self.byte_encoder);
+            let words = self.pretokenize(text.as_ref());
             for word in words {
                 if word.chars().count() >= self.config.min_word_length {
                     *word_freqs.entry(word).or_insert(0) += 1;
@@ -238,14 +261,14 @@ impl InlBpeTrainer {
         word_freqs
     }
 
-    fn count_words_bytelevel<P: AsRef<Path>>(&self, files: &[P]) -> Result<HashMap<String, u32>, std::io::Error> {
+    fn count_words<P: AsRef<Path>>(&self, files: &[P]) -> Result<HashMap<String, u32>, std::io::Error> {
         let mut word_freqs: HashMap<String, u32> = HashMap::new();
         for file_path in files {
             let file = File::open(file_path)?;
             let reader = BufReader::new(file);
             for line in reader.lines() {
                 let line = line?;
-                let words = byte_level_pretokenize(&line, &self.byte_encoder);
+                let words = self.pretokenize(&line);
                 for word in words {
                     if word.chars().count() >= self.config.min_word_length {
                         *word_freqs.entry(word).or_insert(0) += 1;
