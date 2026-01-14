@@ -27,7 +27,7 @@ mod bpe_trainer;
 
 pub use bpe::BpeTokenizer;
 pub use vocab::Vocab;
-pub use huggingface::HuggingFaceTokenizer;
+pub use huggingface::{HuggingFaceTokenizer, ChatTemplateResult};
 pub use trainer::{InlBpeTrainer, TrainerConfig};
 pub use trainers::{WordPieceTrainer, WordPieceTrainerConfig, UnigramTrainer, UnigramTrainerConfig};
 pub use normalizers::Normalizer;
@@ -52,6 +52,7 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyUnigramTrainer>()?;
     m.add_class::<PyBpeTrainer>()?;
     m.add_class::<PyEncoding>()?;
+    m.add_class::<PyBatchEncoding>()?;
     m.add_class::<PyNormalizer>()?;
     m.add_class::<PyPreTokenizer>()?;
     m.add_class::<PyPostProcessor>()?;
@@ -61,7 +62,7 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWordLevelModel>()?;
     m.add_class::<PyCharBpeModel>()?;
     m.add_class::<PyByteLevelBpeModel>()?;
-    m.add("__version__", "0.2.8")?;
+    m.add("__version__", "0.2.9")?;
     Ok(())
 }
 
@@ -83,10 +84,195 @@ impl PyTokenizer {
 
     /// Load tokenizer from HuggingFace Hub
     #[staticmethod]
-    fn from_pretrained(repo_id: &str) -> PyResult<Self> {
-        let inner = HuggingFaceTokenizer::from_pretrained(repo_id)
+    #[pyo3(signature = (repo_id, revision = None, local_files_only = false))]
+    fn from_pretrained(repo_id: &str, revision: Option<&str>, local_files_only: bool) -> PyResult<Self> {
+        let inner = HuggingFaceTokenizer::from_pretrained_with_options(repo_id, revision, local_files_only)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         Ok(Self { inner })
+    }
+
+    /// Call method - encode text(s) to encoding(s)
+    /// This is the main interface: tokenizer("hello") or tokenizer(["hello", "world"])
+    #[pyo3(signature = (
+        text,
+        text_pair = None,
+        add_special_tokens = true,
+        padding = None,
+        truncation = false,
+        max_length = None,
+        stride = 0,
+        return_attention_mask = true,
+        return_token_type_ids = true,
+        return_offsets_mapping = false,
+        return_special_tokens_mask = false
+    ))]
+    fn __call__(
+        &self,
+        text: pyo3::Bound<'_, pyo3::types::PyAny>,
+        text_pair: Option<pyo3::Bound<'_, pyo3::types::PyAny>>,
+        add_special_tokens: bool,
+        padding: Option<&str>,
+        truncation: bool,
+        max_length: Option<usize>,
+        stride: usize,
+        return_attention_mask: bool,
+        return_token_type_ids: bool,
+        return_offsets_mapping: bool,
+        return_special_tokens_mask: bool,
+    ) -> PyResult<PyBatchEncoding> {
+        // Check if input is a list
+        if let Ok(list) = text.extract::<Vec<String>>() {
+            // Batch mode
+            let pairs: Option<Vec<String>> = text_pair.and_then(|p| p.extract().ok());
+
+            let mut result_encodings: Vec<Encoding> = if let Some(pair_list) = pairs {
+                // Batch of pairs
+                list.iter()
+                    .zip(pair_list.iter())
+                    .map(|(a, b)| {
+                        if add_special_tokens {
+                            self.inner.encode_pair_to_encoding(a, b)
+                        } else {
+                            // Encode without special tokens (raw BPE)
+                            let ids_a = self.inner.encode(a);
+                            let ids_b = self.inner.encode(b);
+                            let mut enc = Encoding::from_ids(
+                                ids_a.clone(),
+                                ids_a.iter().filter_map(|&id| self.inner.id_to_token(id)).collect(),
+                            );
+                            let enc_b = Encoding::from_ids(
+                                ids_b.clone(),
+                                ids_b.iter().filter_map(|&id| self.inner.id_to_token(id)).collect(),
+                            );
+                            enc.merge(enc_b, 1);
+                            enc
+                        }
+                    })
+                    .collect()
+            } else {
+                // Batch of single texts
+                list.iter()
+                    .map(|t| {
+                        if add_special_tokens {
+                            self.inner.encode_to_encoding(t)
+                        } else {
+                            // Encode without special tokens (raw BPE)
+                            let ids = self.inner.encode(t);
+                            Encoding::from_ids(
+                                ids.clone(),
+                                ids.iter().filter_map(|&id| self.inner.id_to_token(id)).collect(),
+                            )
+                        }
+                    })
+                    .collect()
+            };
+
+            // Apply truncation with stride if needed
+            let max_len = max_length.unwrap_or(self.inner.model_max_length());
+            if truncation {
+                for enc in &mut result_encodings {
+                    if enc.len() > max_len {
+                        if stride > 0 {
+                            enc.truncate_with_stride(max_len, stride);
+                        } else {
+                            enc.truncate(max_len);
+                        }
+                    }
+                }
+            }
+
+            // Apply padding if needed
+            if let Some(pad_strategy) = padding {
+                let pad_to_len = if pad_strategy == "max_length" {
+                    max_len
+                } else {
+                    // "longest" - pad to longest in batch
+                    result_encodings.iter().map(|e| e.len()).max().unwrap_or(0)
+                };
+                let pad_id = self.inner.special_tokens().get("[PAD]")
+                    .or_else(|| self.inner.special_tokens().get("<pad>"))
+                    .copied()
+                    .unwrap_or(0);
+                let pad_token = self.inner.id_to_token(pad_id).unwrap_or_else(|| "<pad>".to_string());
+                let pad_left = pad_strategy == "left" || self.inner.padding_side() == "left";
+
+                for enc in &mut result_encodings {
+                    enc.pad(pad_to_len, pad_id, &pad_token, pad_left);
+                }
+            }
+
+            Ok(PyBatchEncoding {
+                encodings: result_encodings,
+                return_attention_mask,
+                return_token_type_ids,
+                return_offsets_mapping,
+                return_special_tokens_mask,
+            })
+        } else if let Ok(single_text) = text.extract::<String>() {
+            // Single text mode
+            let pair: Option<String> = text_pair.and_then(|p| p.extract().ok());
+
+            let mut result_encoding = if let Some(ref p) = pair {
+                if add_special_tokens {
+                    self.inner.encode_pair_to_encoding(&single_text, p)
+                } else {
+                    let ids_a = self.inner.encode(&single_text);
+                    let ids_b = self.inner.encode(p);
+                    let mut enc = Encoding::from_ids(
+                        ids_a.clone(),
+                        ids_a.iter().filter_map(|&id| self.inner.id_to_token(id)).collect(),
+                    );
+                    let enc_b = Encoding::from_ids(
+                        ids_b.clone(),
+                        ids_b.iter().filter_map(|&id| self.inner.id_to_token(id)).collect(),
+                    );
+                    enc.merge(enc_b, 1);
+                    enc
+                }
+            } else if add_special_tokens {
+                self.inner.encode_to_encoding(&single_text)
+            } else {
+                let ids = self.inner.encode(&single_text);
+                Encoding::from_ids(
+                    ids.clone(),
+                    ids.iter().filter_map(|&id| self.inner.id_to_token(id)).collect(),
+                )
+            };
+
+            // Apply truncation with stride
+            let max_len = max_length.unwrap_or(self.inner.model_max_length());
+            if truncation && result_encoding.len() > max_len {
+                if stride > 0 {
+                    result_encoding.truncate_with_stride(max_len, stride);
+                } else {
+                    result_encoding.truncate(max_len);
+                }
+            }
+
+            // Apply padding
+            if let Some(pad_strategy) = padding {
+                let pad_to_len = if pad_strategy == "max_length" { max_len } else { result_encoding.len() };
+                let pad_id = self.inner.special_tokens().get("[PAD]")
+                    .or_else(|| self.inner.special_tokens().get("<pad>"))
+                    .copied()
+                    .unwrap_or(0);
+                let pad_token = self.inner.id_to_token(pad_id).unwrap_or_else(|| "<pad>".to_string());
+                let pad_left = pad_strategy == "left" || self.inner.padding_side() == "left";
+                result_encoding.pad(pad_to_len, pad_id, &pad_token, pad_left);
+            }
+
+            Ok(PyBatchEncoding {
+                encodings: vec![result_encoding],
+                return_attention_mask,
+                return_token_type_ids,
+                return_offsets_mapping,
+                return_special_tokens_mask,
+            })
+        } else {
+            Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "Expected str or List[str]"
+            ))
+        }
     }
 
     /// Encode text to token IDs
@@ -310,6 +496,200 @@ impl PyTokenizer {
     /// Set decoder
     fn set_decoder(&mut self, decoder: &PyDecoder) {
         self.inner.set_decoder(decoder.inner.clone());
+    }
+
+    /// Get the full vocabulary as a dict
+    fn get_vocab(&self) -> StdHashMap<String, u32> {
+        self.inner.get_vocab().into_iter().collect()
+    }
+
+    /// Convert token IDs to tokens
+    #[pyo3(signature = (ids, skip_special_tokens = false))]
+    fn convert_ids_to_tokens(&self, ids: Vec<u32>, skip_special_tokens: bool) -> Vec<Option<String>> {
+        self.inner.convert_ids_to_tokens(&ids, skip_special_tokens)
+    }
+
+    /// Model max length property (getter)
+    #[getter]
+    fn model_max_length(&self) -> usize {
+        self.inner.model_max_length()
+    }
+
+    /// Model max length property (setter)
+    #[setter]
+    fn set_model_max_length(&mut self, value: usize) {
+        self.inner.set_model_max_length(value);
+    }
+
+    /// Padding side property (getter)
+    #[getter]
+    fn padding_side(&self) -> String {
+        self.inner.padding_side().to_string()
+    }
+
+    /// Padding side property (setter)
+    #[setter]
+    fn set_padding_side(&mut self, value: &str) {
+        self.inner.set_padding_side(value);
+    }
+
+    /// Truncation side property (getter)
+    #[getter]
+    fn truncation_side(&self) -> String {
+        self.inner.truncation_side().to_string()
+    }
+
+    /// Truncation side property (setter)
+    #[setter]
+    fn set_truncation_side(&mut self, value: &str) {
+        self.inner.set_truncation_side(value);
+    }
+
+    /// Chat template property (getter)
+    #[getter]
+    fn chat_template(&self) -> Option<String> {
+        self.inner.chat_template().map(|s| s.to_string())
+    }
+
+    /// Chat template property (setter)
+    #[setter]
+    fn set_chat_template(&mut self, value: Option<String>) {
+        self.inner.set_chat_template(value);
+    }
+
+    /// Apply chat template to messages
+    /// messages: List[Dict[str, str]] with keys "role" and "content"
+    #[pyo3(signature = (messages, add_generation_prompt = false, tokenize = true))]
+    fn apply_chat_template(
+        &self,
+        messages: Vec<StdHashMap<String, String>>,
+        add_generation_prompt: bool,
+        tokenize: bool,
+    ) -> PyResult<pyo3::Py<pyo3::PyAny>> {
+        use std::collections::HashMap;
+
+        // Convert StdHashMap to std::collections::HashMap
+        let msgs: Vec<HashMap<String, String>> = messages.into_iter()
+            .map(|m| m.into_iter().collect())
+            .collect();
+
+        let result = self.inner.apply_chat_template(&msgs, add_generation_prompt, tokenize)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?;
+
+        Python::with_gil(|py| {
+            match result {
+                ChatTemplateResult::Text(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
+                ChatTemplateResult::Tokenized(ids) => Ok(ids.into_pyobject(py)?.into_any().unbind()),
+            }
+        })
+    }
+
+    /// Prepare inputs for the model
+    #[pyo3(signature = (
+        ids,
+        pair_ids = None,
+        add_special_tokens = true,
+        padding = None,
+        truncation = false,
+        max_length = None,
+        stride = 0,
+        return_attention_mask = true
+    ))]
+    fn prepare_for_model(
+        &self,
+        ids: Vec<u32>,
+        pair_ids: Option<Vec<u32>>,
+        add_special_tokens: bool,
+        padding: Option<&str>,
+        truncation: bool,
+        max_length: Option<usize>,
+        stride: usize,
+        return_attention_mask: bool,
+    ) -> PyEncoding {
+        PyEncoding {
+            inner: self.inner.prepare_for_model(
+                ids,
+                pair_ids,
+                add_special_tokens,
+                padding,
+                truncation,
+                max_length,
+                stride,
+                return_attention_mask,
+            )
+        }
+    }
+
+    /// Push tokenizer to HuggingFace Hub
+    #[pyo3(signature = (repo_id, token = None, private = false))]
+    fn push_to_hub(
+        &self,
+        repo_id: &str,
+        token: Option<&str>,
+        private: bool,
+    ) -> PyResult<String> {
+        // Save to temp directory first
+        let temp_dir = std::env::temp_dir().join(format!("tokenizer_upload_{}", std::process::id()));
+        self.inner.save_pretrained(&temp_dir)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+
+        // Get token from env if not provided
+        let auth_token = token.map(|s| s.to_string())
+            .or_else(|| std::env::var("HF_TOKEN").ok());
+
+        let auth_token = auth_token.ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "No token provided. Set HF_TOKEN environment variable or pass token parameter."
+            )
+        })?;
+
+        // Create repo if needed
+        let create_url = format!("https://huggingface.co/api/repos/create");
+        let create_response = ureq::post(&create_url)
+            .set("Authorization", &format!("Bearer {}", auth_token))
+            .send_json(ureq::json!({
+                "type": "model",
+                "name": repo_id,
+                "private": private
+            }));
+
+        // It's ok if repo already exists
+        if let Err(e) = create_response {
+            let err_str = e.to_string();
+            if !err_str.contains("409") && !err_str.contains("already exists") {
+                // Ignore "already exists" errors
+                eprintln!("Warning creating repo: {}", err_str);
+            }
+        }
+
+        // Upload files
+        let files = ["tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"];
+
+        for filename in &files {
+            let file_path = temp_dir.join(filename);
+            if file_path.exists() {
+                let content = std::fs::read_to_string(&file_path)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+
+                let upload_url = format!(
+                    "https://huggingface.co/api/{}/upload/main/{}",
+                    repo_id, filename
+                );
+
+                ureq::put(&upload_url)
+                    .set("Authorization", &format!("Bearer {}", auth_token))
+                    .set("Content-Type", "application/json")
+                    .send_string(&content)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(
+                        format!("Failed to upload {}: {}", filename, e)
+                    ))?;
+            }
+        }
+
+        // Cleanup temp directory
+        std::fs::remove_dir_all(&temp_dir).ok();
+
+        Ok(format!("https://huggingface.co/{}", repo_id))
     }
 }
 
@@ -552,6 +932,141 @@ impl PyEncoding {
     /// Get special tokens mask as numpy array
     fn special_tokens_mask_as_numpy<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArray1<u32>> {
         numpy::PyArray1::from_vec(py, self.inner.special_tokens_mask.clone())
+    }
+}
+
+// =============================================================================
+// BatchEncoding Python Bindings (result of __call__)
+// =============================================================================
+
+/// Python-exposed BatchEncoding class (result of tokenizer("text"))
+#[pyclass(name = "BatchEncoding")]
+pub struct PyBatchEncoding {
+    encodings: Vec<Encoding>,
+    return_attention_mask: bool,
+    return_token_type_ids: bool,
+    return_offsets_mapping: bool,
+    return_special_tokens_mask: bool,
+}
+
+#[pymethods]
+impl PyBatchEncoding {
+    /// Get input_ids (list of lists for batch, or list for single)
+    #[getter]
+    fn input_ids(&self) -> Vec<Vec<u32>> {
+        self.encodings.iter().map(|e| e.ids.clone()).collect()
+    }
+
+    /// Get attention_mask
+    #[getter]
+    fn attention_mask(&self) -> Vec<Vec<u32>> {
+        if self.return_attention_mask {
+            self.encodings.iter().map(|e| e.attention_mask.clone()).collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Get token_type_ids
+    #[getter]
+    fn token_type_ids(&self) -> Vec<Vec<u32>> {
+        if self.return_token_type_ids {
+            self.encodings.iter().map(|e| e.type_ids.clone()).collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Get special_tokens_mask
+    #[getter]
+    fn special_tokens_mask(&self) -> Vec<Vec<u32>> {
+        if self.return_special_tokens_mask {
+            self.encodings.iter().map(|e| e.special_tokens_mask.clone()).collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Get offset_mapping
+    #[getter]
+    fn offset_mapping(&self) -> Vec<Vec<(usize, usize)>> {
+        if self.return_offsets_mapping {
+            self.encodings.iter().map(|e| e.offsets.clone()).collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Get encodings list
+    fn encodings(&self) -> Vec<PyEncoding> {
+        self.encodings.iter()
+            .map(|e| PyEncoding { inner: e.clone() })
+            .collect()
+    }
+
+    /// Number of sequences in batch
+    fn __len__(&self) -> usize {
+        self.encodings.len()
+    }
+
+    /// Get item by index
+    fn __getitem__(&self, idx: usize) -> PyResult<PyEncoding> {
+        self.encodings.get(idx)
+            .map(|e| PyEncoding { inner: e.clone() })
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyIndexError, _>("Index out of range"))
+    }
+
+    /// Get keys (like a dict)
+    fn keys(&self) -> Vec<&'static str> {
+        let mut keys = vec!["input_ids"];
+        if self.return_attention_mask {
+            keys.push("attention_mask");
+        }
+        if self.return_token_type_ids {
+            keys.push("token_type_ids");
+        }
+        if self.return_special_tokens_mask {
+            keys.push("special_tokens_mask");
+        }
+        if self.return_offsets_mapping {
+            keys.push("offset_mapping");
+        }
+        keys
+    }
+
+    /// Get input_ids as numpy arrays
+    fn input_ids_as_numpy<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, numpy::PyArray1<u32>>> {
+        self.encodings.iter()
+            .map(|e| numpy::PyArray1::from_vec(py, e.ids.clone()))
+            .collect()
+    }
+
+    /// Get attention_mask as numpy arrays
+    fn attention_mask_as_numpy<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, numpy::PyArray1<u32>>> {
+        self.encodings.iter()
+            .map(|e| numpy::PyArray1::from_vec(py, e.attention_mask.clone()))
+            .collect()
+    }
+
+    /// Convert to dict format (HuggingFace compatible)
+    fn to_dict(&self, py: Python<'_>) -> PyResult<pyo3::Py<pyo3::types::PyDict>> {
+        use pyo3::types::PyDict;
+
+        let dict = PyDict::new(py);
+        dict.set_item("input_ids", self.input_ids())?;
+        if self.return_attention_mask {
+            dict.set_item("attention_mask", self.attention_mask())?;
+        }
+        if self.return_token_type_ids {
+            dict.set_item("token_type_ids", self.token_type_ids())?;
+        }
+        if self.return_special_tokens_mask {
+            dict.set_item("special_tokens_mask", self.special_tokens_mask())?;
+        }
+        if self.return_offsets_mapping {
+            dict.set_item("offset_mapping", self.offset_mapping())?;
+        }
+        Ok(dict.into())
     }
 }
 

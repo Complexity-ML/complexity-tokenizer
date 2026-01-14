@@ -1,6 +1,15 @@
 //! HuggingFace tokenizer.json compatibility
 
 use crate::bpe::BpeTokenizer;
+
+/// Result of applying a chat template
+#[derive(Debug, Clone)]
+pub enum ChatTemplateResult {
+    /// Raw text (when tokenize=false)
+    Text(String),
+    /// Token IDs (when tokenize=true)
+    Tokenized(Vec<u32>),
+}
 use crate::decoders::Decoder;
 use crate::encoding::Encoding;
 use crate::normalizers::Normalizer;
@@ -66,6 +75,14 @@ pub struct HuggingFaceTokenizer {
     post_processor: Option<PostProcessor>,
     /// Decoder pipeline
     decoder: Option<Decoder>,
+    /// Model max length (default: 512)
+    model_max_length: usize,
+    /// Padding side ("right" or "left")
+    padding_side: String,
+    /// Truncation side ("right" or "left")
+    truncation_side: String,
+    /// Chat template (Jinja2 format)
+    chat_template: Option<String>,
 }
 
 impl HuggingFaceTokenizer {
@@ -81,10 +98,35 @@ impl HuggingFaceTokenizer {
 
     /// Load from HuggingFace Hub
     pub fn from_pretrained(repo_id: &str) -> io::Result<Self> {
+        Self::from_pretrained_with_options(repo_id, None, false)
+    }
+
+    /// Load from HuggingFace Hub with options
+    pub fn from_pretrained_with_options(
+        repo_id: &str,
+        revision: Option<&str>,
+        local_files_only: bool,
+    ) -> io::Result<Self> {
+        let rev = revision.unwrap_or("main");
+
+        // Check cache first if local_files_only
+        if local_files_only {
+            let config = crate::hub::HubConfig::default();
+            let repo_cache = config.cache_dir.join(repo_id.replace('/', "--"));
+            let cached_file = repo_cache.join("tokenizer.json");
+            if cached_file.exists() {
+                return Self::from_file(cached_file);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Model '{}' not found in cache and local_files_only=true", repo_id),
+            ));
+        }
+
         // Build URL to tokenizer.json
         let url = format!(
-            "https://huggingface.co/{}/resolve/main/tokenizer.json",
-            repo_id
+            "https://huggingface.co/{}/resolve/{}/tokenizer.json",
+            repo_id, rev
         );
 
         // Download (blocking for simplicity - could be async)
@@ -96,11 +138,40 @@ impl HuggingFaceTokenizer {
             .into_json()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        Self::from_tokenizer_json(tokenizer_json)
+        // Also try to load tokenizer_config.json for model_max_length and chat_template
+        let config_url = format!(
+            "https://huggingface.co/{}/resolve/{}/tokenizer_config.json",
+            repo_id, rev
+        );
+
+        let mut model_max_length = 512;
+        let mut chat_template = None;
+
+        if let Ok(config_response) = ureq::get(&config_url).call() {
+            if let Ok(config_json) = config_response.into_json::<serde_json::Value>() {
+                if let Some(max_len) = config_json.get("model_max_length").and_then(|v| v.as_u64()) {
+                    model_max_length = max_len as usize;
+                }
+                if let Some(template) = config_json.get("chat_template").and_then(|v| v.as_str()) {
+                    chat_template = Some(template.to_string());
+                }
+            }
+        }
+
+        Self::from_tokenizer_json_with_config(tokenizer_json, model_max_length, chat_template)
     }
 
     /// Build from parsed tokenizer.json
     fn from_tokenizer_json(json: TokenizerJson) -> io::Result<Self> {
+        Self::from_tokenizer_json_with_config(json, 512, None)
+    }
+
+    /// Build from parsed tokenizer.json with additional config
+    fn from_tokenizer_json_with_config(
+        json: TokenizerJson,
+        model_max_length: usize,
+        chat_template: Option<String>,
+    ) -> io::Result<Self> {
         // Parse merges: "token1 token2" -> (token1, token2)
         let merges: Vec<(String, String)> = json
             .model
@@ -168,6 +239,10 @@ impl HuggingFaceTokenizer {
             pre_tokenizer,
             post_processor,
             decoder,
+            model_max_length,
+            padding_side: "right".to_string(),
+            truncation_side: "right".to_string(),
+            chat_template,
         })
     }
 
@@ -620,6 +695,242 @@ impl HuggingFaceTokenizer {
         &self.special_tokens
     }
 
+    /// Get vocabulary as HashMap
+    pub fn get_vocab(&self) -> HashMap<String, u32> {
+        self.bpe.vocab().clone()
+    }
+
+    /// Convert token IDs to tokens
+    pub fn convert_ids_to_tokens(&self, ids: &[u32], skip_special_tokens: bool) -> Vec<Option<String>> {
+        ids.iter()
+            .map(|&id| {
+                if let Some(token) = self.vocab.get_token(id) {
+                    if skip_special_tokens && self.special_tokens.contains_key(token) {
+                        None
+                    } else {
+                        Some(token.to_string())
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get model max length
+    pub fn model_max_length(&self) -> usize {
+        self.model_max_length
+    }
+
+    /// Set model max length
+    pub fn set_model_max_length(&mut self, max_length: usize) {
+        self.model_max_length = max_length;
+    }
+
+    /// Get padding side
+    pub fn padding_side(&self) -> &str {
+        &self.padding_side
+    }
+
+    /// Set padding side
+    pub fn set_padding_side(&mut self, side: &str) {
+        self.padding_side = side.to_string();
+    }
+
+    /// Get truncation side
+    pub fn truncation_side(&self) -> &str {
+        &self.truncation_side
+    }
+
+    /// Set truncation side
+    pub fn set_truncation_side(&mut self, side: &str) {
+        self.truncation_side = side.to_string();
+    }
+
+    /// Get chat template
+    pub fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
+    }
+
+    /// Set chat template
+    pub fn set_chat_template(&mut self, template: Option<String>) {
+        self.chat_template = template;
+    }
+
+    /// Apply chat template to messages
+    /// Messages format: Vec<HashMap<"role" -> "user"|"assistant"|"system", "content" -> "...">>
+    pub fn apply_chat_template(
+        &self,
+        messages: &[std::collections::HashMap<String, String>],
+        add_generation_prompt: bool,
+        tokenize: bool,
+    ) -> Result<ChatTemplateResult, String> {
+        let template = self.chat_template.as_ref()
+            .ok_or_else(|| "No chat template set for this tokenizer".to_string())?;
+
+        // Simple template processing (not full Jinja2, but covers common patterns)
+        let mut result = String::new();
+
+        // Get special tokens
+        let bos_token = self.vocab.special_tokens().bos_token.as_deref().unwrap_or("<s>");
+        let eos_token = self.vocab.special_tokens().eos_token.as_deref().unwrap_or("</s>");
+
+        // Process each message according to template patterns
+        // Common patterns: ChatML, Llama, Mistral, etc.
+        if template.contains("<|im_start|>") {
+            // ChatML format
+            for msg in messages {
+                let role = msg.get("role").map(|s| s.as_str()).unwrap_or("user");
+                let content = msg.get("content").map(|s| s.as_str()).unwrap_or("");
+                result.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", role, content));
+            }
+            if add_generation_prompt {
+                result.push_str("<|im_start|>assistant\n");
+            }
+        } else if template.contains("[INST]") {
+            // Llama/Mistral format
+            result.push_str(bos_token);
+            for msg in messages {
+                let role = msg.get("role").map(|s| s.as_str()).unwrap_or("user");
+                let content = msg.get("content").map(|s| s.as_str()).unwrap_or("");
+                match role {
+                    "system" => {
+                        result.push_str(&format!("<<SYS>>\n{}\n<</SYS>>\n\n", content));
+                    }
+                    "user" => {
+                        result.push_str(&format!("[INST] {} [/INST]", content));
+                    }
+                    "assistant" => {
+                        result.push_str(&format!(" {}{}", content, eos_token));
+                        result.push_str(bos_token);
+                    }
+                    _ => {}
+                }
+            }
+        } else if template.contains("### ") {
+            // Alpaca-like format
+            for msg in messages {
+                let role = msg.get("role").map(|s| s.as_str()).unwrap_or("user");
+                let content = msg.get("content").map(|s| s.as_str()).unwrap_or("");
+                match role {
+                    "system" => {
+                        result.push_str(&format!("### System:\n{}\n\n", content));
+                    }
+                    "user" => {
+                        result.push_str(&format!("### Human:\n{}\n\n", content));
+                    }
+                    "assistant" => {
+                        result.push_str(&format!("### Assistant:\n{}\n\n", content));
+                    }
+                    _ => {}
+                }
+            }
+            if add_generation_prompt {
+                result.push_str("### Assistant:\n");
+            }
+        } else {
+            // Default simple format
+            for msg in messages {
+                let role = msg.get("role").map(|s| s.as_str()).unwrap_or("user");
+                let content = msg.get("content").map(|s| s.as_str()).unwrap_or("");
+                result.push_str(&format!("{}: {}\n", role, content));
+            }
+            if add_generation_prompt {
+                result.push_str("assistant: ");
+            }
+        }
+
+        if tokenize {
+            let ids = self.encode(&result);
+            Ok(ChatTemplateResult::Tokenized(ids))
+        } else {
+            Ok(ChatTemplateResult::Text(result))
+        }
+    }
+
+    /// Prepare inputs for the model (prepare_for_model equivalent)
+    pub fn prepare_for_model(
+        &self,
+        ids: Vec<u32>,
+        pair_ids: Option<Vec<u32>>,
+        add_special_tokens: bool,
+        padding: Option<&str>,
+        truncation: bool,
+        max_length: Option<usize>,
+        stride: usize,
+        return_attention_mask: bool,
+    ) -> Encoding {
+        let mut encoding = if let Some(pair) = pair_ids {
+            // Create encoding from pair
+            let text_encoding = Encoding::from_ids(
+                ids.clone(),
+                ids.iter().filter_map(|&id| self.vocab.get_token(id).map(|s| s.to_string())).collect(),
+            );
+            let pair_encoding = Encoding::from_ids(
+                pair.clone(),
+                pair.iter().filter_map(|&id| self.vocab.get_token(id).map(|s| s.to_string())).collect(),
+            );
+            let mut merged = text_encoding;
+            merged.merge(pair_encoding, 1);
+            merged
+        } else {
+            Encoding::from_ids(
+                ids.clone(),
+                ids.iter().filter_map(|&id| self.vocab.get_token(id).map(|s| s.to_string())).collect(),
+            )
+        };
+
+        // Apply post-processing (add special tokens)
+        if add_special_tokens {
+            if let Some(ref pp) = self.post_processor {
+                let processed_ids = pp.process(encoding.ids.clone(), None);
+                let added_count = processed_ids.len() - encoding.ids.len();
+                encoding.ids = processed_ids;
+                encoding.attention_mask.extend(std::iter::repeat(1).take(added_count));
+                encoding.special_tokens_mask.extend(std::iter::repeat(1).take(added_count));
+                encoding.type_ids.extend(std::iter::repeat(0).take(added_count));
+            }
+        }
+
+        // Apply truncation
+        let max_len = max_length.unwrap_or(self.model_max_length);
+        if truncation && encoding.len() > max_len {
+            if stride > 0 {
+                encoding.truncate_with_stride(max_len, stride);
+            } else {
+                encoding.truncate(max_len);
+            }
+        }
+
+        // Apply padding
+        if let Some(padding_strategy) = padding {
+            let pad_id = self.special_tokens.get("[PAD]")
+                .or_else(|| self.special_tokens.get("<pad>"))
+                .copied()
+                .unwrap_or(0);
+            let pad_token = self.vocab.get_token(pad_id).unwrap_or("<pad>");
+            let pad_left = padding_strategy == "left" || self.padding_side == "left";
+
+            match padding_strategy {
+                "max_length" => {
+                    encoding.pad(max_len, pad_id, pad_token, pad_left);
+                }
+                "longest" | "left" | "right" => {
+                    // For batch padding, we'd need all sequences - here just pad to max_length
+                    encoding.pad(max_len, pad_id, pad_token, pad_left);
+                }
+                _ => {}
+            }
+        }
+
+        // Update attention mask
+        if return_attention_mask {
+            // Already set
+        }
+
+        encoding
+    }
+
     /// Save tokenizer to file (HuggingFace format)
     pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let vocab = self.bpe.vocab().clone();
@@ -994,7 +1305,7 @@ fn serialize_pre_tokenizer(pre_tokenizer: &PreTokenizer) -> serde_json::Value {
 }
 
 /// Serialize post-processor to JSON
-fn serialize_post_processor(post_processor: &PostProcessor, special_tokens: &HashMap<String, u32>) -> serde_json::Value {
+fn serialize_post_processor(post_processor: &PostProcessor, _special_tokens: &HashMap<String, u32>) -> serde_json::Value {
     match post_processor {
         PostProcessor::TemplateProcessing { single, pair, special_tokens: tokens } => {
             let special_tokens_json: Vec<serde_json::Value> = tokens.iter()

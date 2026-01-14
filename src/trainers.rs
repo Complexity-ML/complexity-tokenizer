@@ -7,7 +7,6 @@ use crate::models::{WordPieceModel, UnigramModel};
 use crate::normalizers::Normalizer;
 use crate::pretokenizers::PreTokenizer;
 use hashbrown::{HashMap, HashSet};
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
