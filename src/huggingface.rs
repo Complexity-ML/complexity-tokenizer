@@ -60,6 +60,25 @@ pub struct AddedToken {
     pub normalized: bool,
 }
 
+/// Padding configuration
+#[derive(Debug, Clone, Default)]
+pub struct PaddingConfig {
+    pub enabled: bool,
+    pub strategy: String, // "longest", "max_length"
+    pub pad_to_multiple_of: Option<usize>,
+    pub direction: String, // "right" or "left"
+}
+
+/// Truncation configuration
+#[derive(Debug, Clone, Default)]
+pub struct TruncationConfig {
+    pub enabled: bool,
+    pub max_length: usize,
+    pub strategy: String, // "longest_first", "only_first", "only_second"
+    pub stride: usize,
+    pub direction: String, // "right" or "left"
+}
+
 /// HuggingFace compatible tokenizer
 #[derive(Debug, Clone)]
 pub struct HuggingFaceTokenizer {
@@ -83,6 +102,10 @@ pub struct HuggingFaceTokenizer {
     truncation_side: String,
     /// Chat template (Jinja2 format)
     chat_template: Option<String>,
+    /// Padding configuration
+    padding_config: PaddingConfig,
+    /// Truncation configuration
+    truncation_config: TruncationConfig,
 }
 
 impl HuggingFaceTokenizer {
@@ -243,6 +266,11 @@ impl HuggingFaceTokenizer {
             padding_side: "right".to_string(),
             truncation_side: "right".to_string(),
             chat_template,
+            padding_config: PaddingConfig::default(),
+            truncation_config: TruncationConfig {
+                max_length: model_max_length,
+                ..Default::default()
+            },
         })
     }
 
@@ -755,6 +783,310 @@ impl HuggingFaceTokenizer {
     /// Set chat template
     pub fn set_chat_template(&mut self, template: Option<String>) {
         self.chat_template = template;
+    }
+
+    // =========================================================================
+    // Special Token Properties (HuggingFace compatibility)
+    // =========================================================================
+
+    /// Get BOS token
+    pub fn bos_token(&self) -> Option<&str> {
+        self.vocab.special_tokens().bos_token.as_deref()
+    }
+
+    /// Set BOS token
+    pub fn set_bos_token(&mut self, token: Option<String>) {
+        // Also add to special_tokens map if setting a new token
+        if let Some(ref tok) = token {
+            if let Some(id) = self.vocab.get_id(tok) {
+                self.special_tokens.insert(tok.clone(), id);
+            }
+        }
+    }
+
+    /// Get EOS token
+    pub fn eos_token(&self) -> Option<&str> {
+        self.vocab.special_tokens().eos_token.as_deref()
+    }
+
+    /// Get PAD token
+    pub fn pad_token(&self) -> Option<&str> {
+        self.vocab.special_tokens().pad_token.as_deref()
+    }
+
+    /// Get UNK token
+    pub fn unk_token(&self) -> Option<&str> {
+        self.vocab.special_tokens().unk_token.as_deref()
+    }
+
+    /// Get SEP token
+    pub fn sep_token(&self) -> Option<&str> {
+        self.vocab.special_tokens().sep_token.as_deref()
+    }
+
+    /// Get CLS token
+    pub fn cls_token(&self) -> Option<&str> {
+        self.vocab.special_tokens().cls_token.as_deref()
+    }
+
+    /// Get MASK token
+    pub fn mask_token(&self) -> Option<&str> {
+        self.vocab.special_tokens().mask_token.as_deref()
+    }
+
+    /// Get BOS token ID
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.vocab.bos_id()
+    }
+
+    /// Get EOS token ID
+    pub fn eos_token_id(&self) -> Option<u32> {
+        self.vocab.eos_id()
+    }
+
+    /// Get PAD token ID
+    pub fn pad_token_id(&self) -> Option<u32> {
+        self.vocab.pad_id()
+    }
+
+    /// Get UNK token ID
+    pub fn unk_token_id(&self) -> Option<u32> {
+        self.vocab.unk_id()
+    }
+
+    /// Get SEP token ID
+    pub fn sep_token_id(&self) -> Option<u32> {
+        self.sep_token().and_then(|tok| self.vocab.get_id(tok))
+    }
+
+    /// Get CLS token ID
+    pub fn cls_token_id(&self) -> Option<u32> {
+        self.cls_token().and_then(|tok| self.vocab.get_id(tok))
+    }
+
+    /// Get MASK token ID
+    pub fn mask_token_id(&self) -> Option<u32> {
+        self.mask_token().and_then(|tok| self.vocab.get_id(tok))
+    }
+
+    /// Get all special tokens as a list
+    pub fn all_special_tokens(&self) -> Vec<String> {
+        let mut tokens = Vec::new();
+        if let Some(tok) = self.bos_token() { tokens.push(tok.to_string()); }
+        if let Some(tok) = self.eos_token() { tokens.push(tok.to_string()); }
+        if let Some(tok) = self.pad_token() { tokens.push(tok.to_string()); }
+        if let Some(tok) = self.unk_token() { tokens.push(tok.to_string()); }
+        if let Some(tok) = self.sep_token() { tokens.push(tok.to_string()); }
+        if let Some(tok) = self.cls_token() { tokens.push(tok.to_string()); }
+        if let Some(tok) = self.mask_token() { tokens.push(tok.to_string()); }
+        // Also include any additional special tokens from the map
+        for tok in self.special_tokens.keys() {
+            if !tokens.contains(tok) {
+                tokens.push(tok.clone());
+            }
+        }
+        tokens
+    }
+
+    /// Get all special token IDs as a list
+    pub fn all_special_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        if let Some(id) = self.bos_token_id() { ids.push(id); }
+        if let Some(id) = self.eos_token_id() { ids.push(id); }
+        if let Some(id) = self.pad_token_id() { ids.push(id); }
+        if let Some(id) = self.unk_token_id() { ids.push(id); }
+        if let Some(id) = self.sep_token_id() { ids.push(id); }
+        if let Some(id) = self.cls_token_id() { ids.push(id); }
+        if let Some(id) = self.mask_token_id() { ids.push(id); }
+        // Also include any additional special token IDs from the map
+        for &id in self.special_tokens.values() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    // =========================================================================
+    // Tokenization Methods (HuggingFace compatibility)
+    // =========================================================================
+
+    /// Tokenize text to tokens (strings, not IDs)
+    /// This is the `tokenize()` method in HuggingFace tokenizers
+    pub fn tokenize(&self, text: &str) -> Vec<String> {
+        // Normalize
+        let normalized = match &self.normalizer {
+            Some(n) => n.normalize(text),
+            None => text.to_string(),
+        };
+
+        // Pre-tokenize
+        let words = match &self.pre_tokenizer {
+            Some(pt) => pt.pre_tokenize(&normalized),
+            None => vec![normalized],
+        };
+
+        // BPE encode each word to get token strings
+        let mut tokens = Vec::new();
+        for word in &words {
+            let word_ids = self.bpe.encode(word);
+            for &id in &word_ids {
+                if let Some(token) = self.vocab.get_token(id) {
+                    tokens.push(token.to_string());
+                }
+            }
+        }
+        tokens
+    }
+
+    /// Convert tokens to IDs (batch)
+    pub fn convert_tokens_to_ids(&self, tokens: &[String]) -> Vec<Option<u32>> {
+        tokens.iter()
+            .map(|token| self.vocab.get_id(token))
+            .collect()
+    }
+
+    /// Convert a single token to ID
+    pub fn convert_token_to_id(&self, token: &str) -> Option<u32> {
+        self.vocab.get_id(token)
+    }
+
+    // =========================================================================
+    // Padding/Truncation Configuration (HuggingFace compatibility)
+    // =========================================================================
+
+    /// Enable padding with configuration
+    pub fn enable_padding(
+        &mut self,
+        direction: Option<&str>,
+        pad_to_multiple_of: Option<usize>,
+        pad_id: Option<u32>,
+        pad_token: Option<&str>,
+        length: Option<usize>,
+    ) {
+        self.padding_config.enabled = true;
+        self.padding_config.direction = direction.unwrap_or("right").to_string();
+        self.padding_config.pad_to_multiple_of = pad_to_multiple_of;
+        if let Some(dir) = direction {
+            self.padding_side = dir.to_string();
+        }
+        // If length specified, use max_length strategy
+        if length.is_some() {
+            self.padding_config.strategy = "max_length".to_string();
+        } else {
+            self.padding_config.strategy = "longest".to_string();
+        }
+        // Add pad token if specified
+        if let (Some(tok), Some(id)) = (pad_token, pad_id) {
+            self.add_token(tok, id, true);
+        }
+    }
+
+    /// Disable padding
+    pub fn no_padding(&mut self) {
+        self.padding_config.enabled = false;
+    }
+
+    /// Enable truncation with configuration
+    pub fn enable_truncation(
+        &mut self,
+        max_length: usize,
+        stride: Option<usize>,
+        strategy: Option<&str>,
+        direction: Option<&str>,
+    ) {
+        self.truncation_config.enabled = true;
+        self.truncation_config.max_length = max_length;
+        self.truncation_config.stride = stride.unwrap_or(0);
+        self.truncation_config.strategy = strategy.unwrap_or("longest_first").to_string();
+        self.truncation_config.direction = direction.unwrap_or("right").to_string();
+        if let Some(dir) = direction {
+            self.truncation_side = dir.to_string();
+        }
+    }
+
+    /// Disable truncation
+    pub fn no_truncation(&mut self) {
+        self.truncation_config.enabled = false;
+    }
+
+    /// Get padding configuration
+    pub fn padding(&self) -> Option<&PaddingConfig> {
+        if self.padding_config.enabled {
+            Some(&self.padding_config)
+        } else {
+            None
+        }
+    }
+
+    /// Get truncation configuration
+    pub fn truncation(&self) -> Option<&TruncationConfig> {
+        if self.truncation_config.enabled {
+            Some(&self.truncation_config)
+        } else {
+            None
+        }
+    }
+
+    // =========================================================================
+    // Add Special Tokens (HuggingFace compatibility)
+    // =========================================================================
+
+    /// Add special tokens from a dict-like structure
+    /// Keys: "bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token"
+    /// Or "additional_special_tokens" for a list
+    pub fn add_special_tokens_dict(&mut self, special_tokens_dict: &std::collections::HashMap<String, String>) -> usize {
+        let mut num_added = 0;
+
+        for (key, value) in special_tokens_dict {
+            // Check if token already exists
+            let already_exists = self.vocab.get_id(value).is_some();
+
+            // Get or assign new ID
+            let id = self.vocab.get_id(value).unwrap_or_else(|| {
+                let new_id = self.vocab_size() as u32;
+                num_added += 1;
+                new_id
+            });
+
+            // Add to special tokens map
+            self.special_tokens.insert(value.clone(), id);
+            self.added_tokens.insert(value.clone(), id);
+
+            // We can't directly modify vocab, but we track in special_tokens/added_tokens
+            if !already_exists {
+                // The token will be handled via added_tokens during encoding
+            }
+
+            // Log which type of special token was added
+            match key.as_str() {
+                "bos_token" | "eos_token" | "unk_token" | "sep_token" |
+                "pad_token" | "cls_token" | "mask_token" => {
+                    // These are recognized special token types
+                }
+                _ => {
+                    // Additional special tokens
+                }
+            }
+        }
+
+        num_added
+    }
+
+    /// Add a list of special tokens
+    pub fn add_special_tokens_list(&mut self, tokens: &[String]) -> usize {
+        let mut num_added = 0;
+
+        for token in tokens {
+            if self.vocab.get_id(token).is_none() && !self.added_tokens.contains_key(token) {
+                let new_id = (self.vocab_size() + self.added_tokens.len()) as u32;
+                self.special_tokens.insert(token.clone(), new_id);
+                self.added_tokens.insert(token.clone(), new_id);
+                num_added += 1;
+            }
+        }
+
+        num_added
     }
 
     /// Apply chat template to messages

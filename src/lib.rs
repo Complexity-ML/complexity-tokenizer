@@ -27,7 +27,7 @@ mod bpe_trainer;
 
 pub use bpe::BpeTokenizer;
 pub use vocab::Vocab;
-pub use huggingface::{HuggingFaceTokenizer, ChatTemplateResult};
+pub use huggingface::{HuggingFaceTokenizer, ChatTemplateResult, PaddingConfig, TruncationConfig};
 pub use trainer::{InlBpeTrainer, TrainerConfig};
 pub use trainers::{WordPieceTrainer, WordPieceTrainerConfig, UnigramTrainer, UnigramTrainerConfig};
 pub use normalizers::Normalizer;
@@ -62,7 +62,7 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWordLevelModel>()?;
     m.add_class::<PyCharBpeModel>()?;
     m.add_class::<PyByteLevelBpeModel>()?;
-    m.add("__version__", "0.2.9")?;
+    m.add("__version__", "0.3.0")?;
     Ok(())
 }
 
@@ -690,6 +690,183 @@ impl PyTokenizer {
         std::fs::remove_dir_all(&temp_dir).ok();
 
         Ok(format!("https://huggingface.co/{}", repo_id))
+    }
+
+    // =========================================================================
+    // Special Token Properties (HuggingFace compatibility)
+    // =========================================================================
+
+    /// BOS token (getter)
+    #[getter]
+    fn bos_token(&self) -> Option<String> {
+        self.inner.bos_token().map(|s| s.to_string())
+    }
+
+    /// EOS token (getter)
+    #[getter]
+    fn eos_token(&self) -> Option<String> {
+        self.inner.eos_token().map(|s| s.to_string())
+    }
+
+    /// PAD token (getter)
+    #[getter]
+    fn pad_token(&self) -> Option<String> {
+        self.inner.pad_token().map(|s| s.to_string())
+    }
+
+    /// UNK token (getter)
+    #[getter]
+    fn unk_token(&self) -> Option<String> {
+        self.inner.unk_token().map(|s| s.to_string())
+    }
+
+    /// SEP token (getter)
+    #[getter]
+    fn sep_token(&self) -> Option<String> {
+        self.inner.sep_token().map(|s| s.to_string())
+    }
+
+    /// CLS token (getter)
+    #[getter]
+    fn cls_token(&self) -> Option<String> {
+        self.inner.cls_token().map(|s| s.to_string())
+    }
+
+    /// MASK token (getter)
+    #[getter]
+    fn mask_token(&self) -> Option<String> {
+        self.inner.mask_token().map(|s| s.to_string())
+    }
+
+    /// BOS token ID (getter)
+    #[getter]
+    fn bos_token_id(&self) -> Option<u32> {
+        self.inner.bos_token_id()
+    }
+
+    /// EOS token ID (getter)
+    #[getter]
+    fn eos_token_id(&self) -> Option<u32> {
+        self.inner.eos_token_id()
+    }
+
+    /// PAD token ID (getter)
+    #[getter]
+    fn pad_token_id(&self) -> Option<u32> {
+        self.inner.pad_token_id()
+    }
+
+    /// UNK token ID (getter)
+    #[getter]
+    fn unk_token_id(&self) -> Option<u32> {
+        self.inner.unk_token_id()
+    }
+
+    /// SEP token ID (getter)
+    #[getter]
+    fn sep_token_id(&self) -> Option<u32> {
+        self.inner.sep_token_id()
+    }
+
+    /// CLS token ID (getter)
+    #[getter]
+    fn cls_token_id(&self) -> Option<u32> {
+        self.inner.cls_token_id()
+    }
+
+    /// MASK token ID (getter)
+    #[getter]
+    fn mask_token_id(&self) -> Option<u32> {
+        self.inner.mask_token_id()
+    }
+
+    /// All special tokens (getter)
+    #[getter]
+    fn all_special_tokens(&self) -> Vec<String> {
+        self.inner.all_special_tokens()
+    }
+
+    /// All special token IDs (getter)
+    #[getter]
+    fn all_special_ids(&self) -> Vec<u32> {
+        self.inner.all_special_ids()
+    }
+
+    // =========================================================================
+    // Tokenization Methods (HuggingFace compatibility)
+    // =========================================================================
+
+    /// Tokenize text to tokens (strings, not IDs)
+    /// Returns a list of token strings
+    fn tokenize(&self, text: &str) -> Vec<String> {
+        self.inner.tokenize(text)
+    }
+
+    /// Convert tokens to IDs (batch)
+    fn convert_tokens_to_ids(&self, tokens: Vec<String>) -> Vec<Option<u32>> {
+        self.inner.convert_tokens_to_ids(&tokens)
+    }
+
+    /// Batch decode (alias for decode_batch_with_options)
+    #[pyo3(signature = (sequences, skip_special_tokens = false, clean_up_tokenization_spaces = true))]
+    fn batch_decode(
+        &self,
+        sequences: Vec<Vec<u32>>,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> Vec<String> {
+        self.inner.decode_batch_with_options(&sequences, skip_special_tokens, clean_up_tokenization_spaces)
+    }
+
+    // =========================================================================
+    // Padding/Truncation Configuration (HuggingFace compatibility)
+    // =========================================================================
+
+    /// Enable padding
+    #[pyo3(signature = (direction = None, pad_to_multiple_of = None, pad_id = None, pad_token = None, length = None))]
+    fn enable_padding(
+        &mut self,
+        direction: Option<&str>,
+        pad_to_multiple_of: Option<usize>,
+        pad_id: Option<u32>,
+        pad_token: Option<&str>,
+        length: Option<usize>,
+    ) {
+        self.inner.enable_padding(direction, pad_to_multiple_of, pad_id, pad_token, length);
+    }
+
+    /// Disable padding
+    fn no_padding(&mut self) {
+        self.inner.no_padding();
+    }
+
+    /// Enable truncation
+    #[pyo3(signature = (max_length, stride = None, strategy = None, direction = None))]
+    fn enable_truncation(
+        &mut self,
+        max_length: usize,
+        stride: Option<usize>,
+        strategy: Option<&str>,
+        direction: Option<&str>,
+    ) {
+        self.inner.enable_truncation(max_length, stride, strategy, direction);
+    }
+
+    /// Disable truncation
+    fn no_truncation(&mut self) {
+        self.inner.no_truncation();
+    }
+
+    // =========================================================================
+    // Add Special Tokens (HuggingFace compatibility)
+    // =========================================================================
+
+    /// Add special tokens from a dictionary
+    /// Returns the number of tokens added to the vocabulary
+    fn add_special_tokens(&mut self, special_tokens_dict: StdHashMap<String, String>) -> usize {
+        use std::collections::HashMap;
+        let map: HashMap<String, String> = special_tokens_dict.into_iter().collect();
+        self.inner.add_special_tokens_dict(&map)
     }
 }
 
