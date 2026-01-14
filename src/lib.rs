@@ -26,7 +26,7 @@ use std::collections::HashMap as StdHashMap;
 fn complexity_tokenizer(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyTrainer>()?;
-    m.add("__version__", "0.1.8")?;
+    m.add("__version__", "0.1.9")?;
     Ok(())
 }
 
