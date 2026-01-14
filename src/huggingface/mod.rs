@@ -549,52 +549,88 @@ impl HuggingFaceTokenizer {
     // =========================================================================
 
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        // First normalize the text
+        let normalized = match &self.normalizer {
+            Some(n) => n.normalize(text),
+            None => text.to_string(),
+        };
+
+        // Then pre-tokenize to get words (with ByteLevel encoding if applicable)
+        let words = match &self.pre_tokenizer {
+            Some(pt) => pt.pre_tokenize(&normalized),
+            None => vec![normalized.clone()],
+        };
+
+        // Now encode each word through BPE
         let mut result = Vec::new();
-        let mut remaining = text;
+        for word in &words {
+            // Check for added tokens within the word
+            let mut remaining = word.as_str();
 
-        while !remaining.is_empty() {
-            let mut found_special = false;
-            let mut best_match: Option<(&str, u32, usize)> = None;
+            while !remaining.is_empty() {
+                let mut found_special = false;
+                let mut best_match: Option<(&str, u32, usize)> = None;
 
-            for (token, &id) in &self.added_tokens {
-                if let Some(config) = self.added_tokens_config.get(token) {
-                    // Check for match with proper lstrip/rstrip/single_word handling
-                    if let Some(pos) = self.find_added_token(remaining, token, config) {
-                        if pos == 0 {
-                            // Direct match at start
-                            if best_match.is_none() || token.len() > best_match.unwrap().0.len() {
-                                best_match = Some((token, id, token.len()));
+                for (token, &id) in &self.added_tokens {
+                    if let Some(config) = self.added_tokens_config.get(token) {
+                        if let Some(pos) = self.find_added_token(remaining, token, config) {
+                            if pos == 0 {
+                                if best_match.is_none() || token.len() > best_match.unwrap().0.len() {
+                                    best_match = Some((token, id, token.len()));
+                                }
                             }
                         }
-                    }
-                } else if remaining.starts_with(token) {
-                    if best_match.is_none() || token.len() > best_match.unwrap().0.len() {
-                        best_match = Some((token, id, token.len()));
+                    } else if remaining.starts_with(token) {
+                        if best_match.is_none() || token.len() > best_match.unwrap().0.len() {
+                            best_match = Some((token, id, token.len()));
+                        }
                     }
                 }
-            }
 
-            if let Some((_, id, len)) = best_match {
-                result.push(id);
-                remaining = &remaining[len..];
-                found_special = true;
-            }
+                if let Some((_, id, len)) = best_match {
+                    result.push(id);
+                    remaining = &remaining[len..];
+                    found_special = true;
+                }
 
-            if !found_special {
-                let next_special_pos = self.find_next_added_token_pos(remaining);
+                if !found_special {
+                    let next_special_pos = self.find_next_added_token_in_word(remaining);
 
-                if next_special_pos > 0 {
-                    let chunk = &remaining[..next_special_pos];
-                    result.extend(self.bpe.encode(chunk));
-                    remaining = &remaining[next_special_pos..];
-                } else if next_special_pos == 0 {
-                    // Shouldn't happen, but safety net
-                    break;
+                    if next_special_pos > 0 {
+                        let chunk = &remaining[..next_special_pos];
+                        result.extend(self.bpe.encode(chunk));
+                        remaining = &remaining[next_special_pos..];
+                    } else {
+                        // No special token found, encode the entire remaining word
+                        result.extend(self.bpe.encode(remaining));
+                        break;
+                    }
                 }
             }
         }
 
         result
+    }
+
+    /// Find the position of the next added token within a word
+    fn find_next_added_token_in_word(&self, text: &str) -> usize {
+        let mut min_pos = text.len();
+
+        for (token, _) in &self.added_tokens {
+            if let Some(config) = self.added_tokens_config.get(token) {
+                if let Some(pos) = self.find_added_token(text, token, config) {
+                    if pos > 0 {
+                        min_pos = min_pos.min(pos);
+                    }
+                }
+            } else if let Some(pos) = text.find(token) {
+                if pos > 0 {
+                    min_pos = min_pos.min(pos);
+                }
+            }
+        }
+
+        min_pos
     }
 
     /// Find an added token considering lstrip/rstrip/single_word flags
