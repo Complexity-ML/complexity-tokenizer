@@ -77,6 +77,21 @@ pub fn serialize_pre_tokenizer(pre_tokenizer: &PreTokenizer) -> serde_json::Valu
             "behavior": "Removed",
             "invert": invert
         }),
+        PreTokenizer::SplitWithBehavior { pattern, behavior, invert } => {
+            let behavior_str = match behavior {
+                crate::pretokenizers::SplitBehavior::Removed => "Removed",
+                crate::pretokenizers::SplitBehavior::Isolated => "Isolated",
+                crate::pretokenizers::SplitBehavior::MergedWithPrevious => "MergedWithPrevious",
+                crate::pretokenizers::SplitBehavior::MergedWithNext => "MergedWithNext",
+                crate::pretokenizers::SplitBehavior::Contiguous => "Contiguous",
+            };
+            serde_json::json!({
+                "type": "Split",
+                "pattern": {"Regex": pattern},
+                "behavior": behavior_str,
+                "invert": invert
+            })
+        }
         PreTokenizer::GPT2 => serde_json::json!({
             "type": "ByteLevel",
             "add_prefix_space": false,
@@ -166,6 +181,18 @@ pub fn serialize_decoder(decoder: &Decoder) -> serde_json::Value {
             "type": "Replace",
             "pattern": pattern,
             "content": replacement
+        }),
+        Decoder::CTC { pad_token, word_delimiter_token } => serde_json::json!({
+            "type": "CTC",
+            "pad_token": pad_token,
+            "word_delimiter_token": word_delimiter_token
+        }),
+        Decoder::Fuse => serde_json::json!({"type": "Fuse"}),
+        Decoder::Strip { content, start, stop } => serde_json::json!({
+            "type": "Strip",
+            "content": content.to_string(),
+            "start": start,
+            "stop": stop
         }),
         Decoder::Sequence(decoders) => serde_json::json!({
             "type": "Sequence",

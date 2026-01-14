@@ -14,6 +14,27 @@ static GPT2_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// Split behavior for regex patterns
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SplitBehavior {
+    /// Remove the matched pattern from output
+    Removed,
+    /// Keep the pattern as its own isolated token
+    Isolated,
+    /// Merge matched pattern with the previous token
+    MergedWithPrevious,
+    /// Merge matched pattern with the next token
+    MergedWithNext,
+    /// Consecutive matches are merged together
+    Contiguous,
+}
+
+impl Default for SplitBehavior {
+    fn default() -> Self {
+        SplitBehavior::Removed
+    }
+}
+
 /// Pre-tokenizer types
 #[derive(Debug, Clone)]
 pub enum PreTokenizer {
@@ -29,8 +50,10 @@ pub enum PreTokenizer {
     Punctuation,
     /// Split digits into individual tokens
     Digits { individual_digits: bool },
-    /// Split using regex pattern
+    /// Split using regex pattern (legacy, uses Removed behavior)
     Split { pattern: String, invert: bool },
+    /// Split using regex pattern with behavior control
+    SplitWithBehavior { pattern: String, behavior: SplitBehavior, invert: bool },
     /// GPT-2 style regex splitting
     GPT2,
     /// BERT-style pre-tokenizer (whitespace + punctuation + chinese chars)
@@ -72,6 +95,9 @@ impl PreTokenizer {
             }
             PreTokenizer::Split { pattern, invert } => {
                 regex_split(text, pattern, *invert)
+            }
+            PreTokenizer::SplitWithBehavior { pattern, behavior, invert } => {
+                regex_split_with_behavior(text, pattern, *behavior, *invert)
             }
             PreTokenizer::GPT2 => {
                 gpt2_pretokenize(text)
@@ -262,6 +288,144 @@ fn regex_split(text: &str, pattern: &str, invert: bool) -> Vec<String> {
     } else {
         vec![text.to_string()]
     }
+}
+
+/// Split using regex pattern with behavior control
+fn regex_split_with_behavior(text: &str, pattern: &str, behavior: SplitBehavior, invert: bool) -> Vec<String> {
+    let re = match Regex::new(pattern) {
+        Ok(r) => r,
+        Err(_) => return vec![text.to_string()],
+    };
+
+    // Collect all matches and their positions
+    let matches: Vec<_> = re.find_iter(text).collect();
+    if matches.is_empty() {
+        return vec![text.to_string()];
+    }
+
+    // Build result based on behavior
+    let mut result = Vec::new();
+    let mut last_end = 0;
+
+    match behavior {
+        SplitBehavior::Removed => {
+            // Same as invert=true in legacy Split
+            for m in &matches {
+                if invert {
+                    // Keep non-matching parts only
+                    if m.start() > last_end {
+                        result.push(text[last_end..m.start()].to_string());
+                    }
+                } else {
+                    // Keep matching parts only
+                    result.push(m.as_str().to_string());
+                }
+                last_end = m.end();
+            }
+            if invert && last_end < text.len() {
+                result.push(text[last_end..].to_string());
+            }
+        }
+        SplitBehavior::Isolated => {
+            // Keep both matches and non-matches as separate tokens
+            for m in &matches {
+                if m.start() > last_end {
+                    let before = &text[last_end..m.start()];
+                    if !before.is_empty() {
+                        result.push(before.to_string());
+                    }
+                }
+                result.push(m.as_str().to_string());
+                last_end = m.end();
+            }
+            if last_end < text.len() {
+                result.push(text[last_end..].to_string());
+            }
+        }
+        SplitBehavior::MergedWithPrevious => {
+            // Merge matches with the token before them
+            for m in &matches {
+                if m.start() > last_end {
+                    let before = &text[last_end..m.start()];
+                    if !before.is_empty() {
+                        // Merge this part with the match
+                        result.push(format!("{}{}", before, m.as_str()));
+                    } else if !result.is_empty() {
+                        // Append match to previous token
+                        let prev = result.pop().unwrap();
+                        result.push(format!("{}{}", prev, m.as_str()));
+                    } else {
+                        result.push(m.as_str().to_string());
+                    }
+                } else if !result.is_empty() {
+                    let prev = result.pop().unwrap();
+                    result.push(format!("{}{}", prev, m.as_str()));
+                } else {
+                    result.push(m.as_str().to_string());
+                }
+                last_end = m.end();
+            }
+            if last_end < text.len() {
+                result.push(text[last_end..].to_string());
+            }
+        }
+        SplitBehavior::MergedWithNext => {
+            // Merge matches with the token after them
+            let mut pending_match: Option<&str> = None;
+            for m in &matches {
+                if m.start() > last_end {
+                    let before = &text[last_end..m.start()];
+                    if let Some(pm) = pending_match {
+                        result.push(format!("{}{}", pm, before));
+                    } else if !before.is_empty() {
+                        result.push(before.to_string());
+                    }
+                } else if let Some(pm) = pending_match {
+                    // No text between matches, output pending
+                    result.push(pm.to_string());
+                }
+                pending_match = Some(m.as_str());
+                last_end = m.end();
+            }
+            // Handle remaining text
+            if last_end < text.len() {
+                let remaining = &text[last_end..];
+                if let Some(pm) = pending_match {
+                    result.push(format!("{}{}", pm, remaining));
+                } else {
+                    result.push(remaining.to_string());
+                }
+            } else if let Some(pm) = pending_match {
+                result.push(pm.to_string());
+            }
+        }
+        SplitBehavior::Contiguous => {
+            // Merge consecutive matches together
+            let mut current_match = String::new();
+            for m in &matches {
+                if m.start() > last_end {
+                    let before = &text[last_end..m.start()];
+                    if !current_match.is_empty() {
+                        result.push(current_match.clone());
+                        current_match.clear();
+                    }
+                    if !before.is_empty() {
+                        result.push(before.to_string());
+                    }
+                }
+                current_match.push_str(m.as_str());
+                last_end = m.end();
+            }
+            if !current_match.is_empty() {
+                result.push(current_match);
+            }
+            if last_end < text.len() {
+                result.push(text[last_end..].to_string());
+            }
+        }
+    }
+
+    result.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
 /// GPT-2 style pre-tokenization with regex
@@ -499,5 +663,53 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], "Hello");
         assert_eq!(result[1], "こんにちは");
+    }
+
+    #[test]
+    fn test_split_isolated() {
+        let pt = PreTokenizer::SplitWithBehavior {
+            pattern: r"\s".to_string(),
+            behavior: SplitBehavior::Isolated,
+            invert: false,
+        };
+        let result = pt.pre_tokenize("hello world test");
+        // Should keep spaces as isolated tokens
+        assert_eq!(result, vec!["hello", " ", "world", " ", "test"]);
+    }
+
+    #[test]
+    fn test_split_merged_with_previous() {
+        let pt = PreTokenizer::SplitWithBehavior {
+            pattern: r"!".to_string(),
+            behavior: SplitBehavior::MergedWithPrevious,
+            invert: false,
+        };
+        let result = pt.pre_tokenize("hello! world!");
+        // Exclamation marks should merge with previous word
+        assert_eq!(result, vec!["hello!", " world!"]);
+    }
+
+    #[test]
+    fn test_split_merged_with_next() {
+        let pt = PreTokenizer::SplitWithBehavior {
+            pattern: r"\$".to_string(),
+            behavior: SplitBehavior::MergedWithNext,
+            invert: false,
+        };
+        let result = pt.pre_tokenize("price $100 and $50");
+        // Dollar signs should merge with next token
+        assert_eq!(result, vec!["price ", "$100 and ", "$50"]);
+    }
+
+    #[test]
+    fn test_split_contiguous() {
+        let pt = PreTokenizer::SplitWithBehavior {
+            pattern: r"\d".to_string(),
+            behavior: SplitBehavior::Contiguous,
+            invert: false,
+        };
+        let result = pt.pre_tokenize("abc123def456");
+        // Consecutive digits should be merged
+        assert_eq!(result, vec!["abc", "123", "def", "456"]);
     }
 }

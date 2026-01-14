@@ -323,10 +323,28 @@ mod tests {
     }
 
     #[test]
-    fn test_truncation() {
+    fn test_truncation_only_first() {
         let mut ids = vec![1, 2, 3, 4, 5];
         truncate(&mut ids, None, 3, TruncationStrategy::OnlyFirst);
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_truncation_only_second() {
+        let mut ids = vec![1, 2, 3];
+        let mut pair = vec![4, 5, 6, 7, 8];
+        truncate(&mut ids, Some(&mut pair), 5, TruncationStrategy::OnlySecond);
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(pair, vec![4, 5]);
+    }
+
+    #[test]
+    fn test_truncation_longest_first() {
+        let mut ids = vec![1, 2, 3];
+        let mut pair = vec![4, 5, 6, 7, 8];
+        truncate(&mut ids, Some(&mut pair), 5, TruncationStrategy::LongestFirst);
+        // Should truncate the longer one (pair) first
+        assert_eq!(ids.len() + pair.len(), 5);
     }
 
     #[test]

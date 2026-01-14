@@ -151,7 +151,18 @@ pub fn parse_pre_tokenizer(json: &Option<serde_json::Value>) -> Option<PreTokeni
                             .get("invert")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        Some(PreTokenizer::Split { pattern, invert })
+                        let behavior_str = obj
+                            .get("behavior")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Removed");
+                        let behavior = match behavior_str {
+                            "Isolated" => crate::pretokenizers::SplitBehavior::Isolated,
+                            "MergedWithPrevious" => crate::pretokenizers::SplitBehavior::MergedWithPrevious,
+                            "MergedWithNext" => crate::pretokenizers::SplitBehavior::MergedWithNext,
+                            "Contiguous" => crate::pretokenizers::SplitBehavior::Contiguous,
+                            _ => crate::pretokenizers::SplitBehavior::Removed,
+                        };
+                        Some(PreTokenizer::SplitWithBehavior { pattern, behavior, invert })
                     }
                     "Sequence" => {
                         if let Some(pretokenizers) = obj.get("pretokenizers").and_then(|v| v.as_array()) {
@@ -299,6 +310,50 @@ pub fn parse_decoder(json: &Option<serde_json::Value>) -> Option<Decoder> {
                             .unwrap_or("</w>")
                             .to_string();
                         Some(Decoder::BPE { suffix })
+                    }
+                    "CTC" => {
+                        let pad_token = obj
+                            .get("pad_token")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<pad>")
+                            .to_string();
+                        let word_delimiter_token = obj
+                            .get("word_delimiter_token")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        Some(Decoder::CTC { pad_token, word_delimiter_token })
+                    }
+                    "Fuse" => Some(Decoder::Fuse),
+                    "Strip" => {
+                        let content = obj
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.chars().next())
+                            .unwrap_or(' ');
+                        let start = obj
+                            .get("start")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let stop = obj
+                            .get("stop")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        Some(Decoder::Strip { content, start, stop })
+                    }
+                    "Sequence" => {
+                        if let Some(decoders) = obj.get("decoders").and_then(|v| v.as_array()) {
+                            let parsed: Vec<Decoder> = decoders
+                                .iter()
+                                .filter_map(|d| parse_decoder(&Some(d.clone())))
+                                .collect();
+                            if !parsed.is_empty() {
+                                Some(Decoder::Sequence(parsed))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     }
                     _ => None,
                 };

@@ -148,6 +148,25 @@ impl PyPreTokenizer {
         Self { inner: PreTokenizer::UnicodeScripts }
     }
 
+    #[staticmethod]
+    #[pyo3(signature = (pattern, behavior = "Removed", invert = false))]
+    fn split(pattern: String, behavior: &str, invert: bool) -> Self {
+        let split_behavior = match behavior {
+            "Isolated" => crate::pretokenizers::SplitBehavior::Isolated,
+            "MergedWithPrevious" => crate::pretokenizers::SplitBehavior::MergedWithPrevious,
+            "MergedWithNext" => crate::pretokenizers::SplitBehavior::MergedWithNext,
+            "Contiguous" => crate::pretokenizers::SplitBehavior::Contiguous,
+            _ => crate::pretokenizers::SplitBehavior::Removed,
+        };
+        Self {
+            inner: PreTokenizer::SplitWithBehavior {
+                pattern,
+                behavior: split_behavior,
+                invert,
+            },
+        }
+    }
+
     fn pre_tokenize(&self, text: &str) -> Vec<String> {
         self.inner.pre_tokenize(text)
     }
@@ -243,6 +262,27 @@ impl PyDecoder {
     fn bpe(suffix: String) -> Self {
         Self {
             inner: Decoder::BPE { suffix },
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (pad_token = "<pad>".to_string(), word_delimiter_token = None))]
+    fn ctc(pad_token: String, word_delimiter_token: Option<String>) -> Self {
+        Self {
+            inner: Decoder::CTC { pad_token, word_delimiter_token },
+        }
+    }
+
+    #[staticmethod]
+    fn fuse() -> Self {
+        Self { inner: Decoder::Fuse }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (content = ' ', start = 0, stop = 0))]
+    fn strip(content: char, start: usize, stop: usize) -> Self {
+        Self {
+            inner: Decoder::Strip { content, start, stop },
         }
     }
 

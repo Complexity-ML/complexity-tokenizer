@@ -17,6 +17,12 @@ pub enum Decoder {
     BPE { suffix: String },
     /// Replace patterns
     Replace { pattern: String, replacement: String },
+    /// CTC decoder - removes blank tokens and merges consecutive duplicates
+    CTC { pad_token: String, word_delimiter_token: Option<String> },
+    /// Fuse decoder - merges all tokens into a single string
+    Fuse,
+    /// Strip decoder - strips specific characters from the decoded string
+    Strip { content: char, start: usize, stop: usize },
     /// Sequence of decoders
     Sequence(Vec<Decoder>),
 }
@@ -38,6 +44,15 @@ impl Decoder {
             Decoder::Replace { pattern, replacement } => {
                 let text = tokens.join("");
                 text.replace(pattern, replacement)
+            }
+            Decoder::CTC { pad_token, word_delimiter_token } => {
+                ctc_decode(tokens, pad_token, word_delimiter_token.as_deref())
+            }
+            Decoder::Fuse => {
+                fuse_decode(tokens)
+            }
+            Decoder::Strip { content, start, stop } => {
+                strip_decode(tokens, *content, *start, *stop)
             }
             Decoder::Sequence(decoders) => {
                 let mut result = tokens.to_vec();
@@ -162,6 +177,71 @@ fn bpe_decode(tokens: &[String], suffix: &str) -> String {
     result.trim_end().to_string()
 }
 
+/// CTC decoding - removes blank tokens and merges consecutive duplicates
+/// Used for speech recognition models (Wav2Vec2, etc.)
+fn ctc_decode(tokens: &[String], pad_token: &str, word_delimiter_token: Option<&str>) -> String {
+    let mut result = Vec::new();
+    let mut prev_token: Option<&str> = None;
+
+    for token in tokens {
+        // Skip pad/blank tokens
+        if token == pad_token {
+            prev_token = None;
+            continue;
+        }
+
+        // Handle word delimiter
+        if let Some(delim) = word_delimiter_token {
+            if token == delim {
+                result.push(" ".to_string());
+                prev_token = None;
+                continue;
+            }
+        }
+
+        // Merge consecutive duplicates (CTC collapse)
+        if prev_token != Some(token.as_str()) {
+            result.push(token.clone());
+        }
+        prev_token = Some(token.as_str());
+    }
+
+    result.join("")
+}
+
+/// Fuse decoding - simply concatenates all tokens
+fn fuse_decode(tokens: &[String]) -> String {
+    tokens.join("")
+}
+
+/// Strip decoding - strips specific characters from start/end of result
+fn strip_decode(tokens: &[String], content: char, start: usize, stop: usize) -> String {
+    let text = tokens.join("");
+
+    let mut result = text.clone();
+
+    // Strip from start
+    for _ in 0..start {
+        if result.starts_with(content) {
+            result = result[content.len_utf8()..].to_string();
+        } else {
+            break;
+        }
+    }
+
+    // Strip from end
+    for _ in 0..stop {
+        if result.ends_with(content) {
+            let new_len = result.len() - content.len_utf8();
+            result.truncate(new_len);
+        } else {
+            break;
+        }
+    }
+
+    result
+}
+
 /// Default decoder (ByteLevel)
 pub fn default_decoder() -> Decoder {
     Decoder::ByteLevel
@@ -197,5 +277,39 @@ mod tests {
         let tokens = vec!["ĠHello".to_string(), "Ġworld".to_string()];
         let result = decoder.decode(&tokens);
         assert!(result.contains("Hello"));
+    }
+
+    #[test]
+    fn test_ctc_decode() {
+        let decoder = Decoder::CTC {
+            pad_token: "<pad>".to_string(),
+            word_delimiter_token: Some("|".to_string()),
+        };
+        // CTC output often has duplicates and blanks
+        let tokens = vec![
+            "H".to_string(), "H".to_string(), "E".to_string(),
+            "<pad>".to_string(), "L".to_string(), "L".to_string(),
+            "O".to_string(), "|".to_string(), "W".to_string(),
+        ];
+        let result = decoder.decode(&tokens);
+        assert_eq!(result, "HELO W");
+    }
+
+    #[test]
+    fn test_fuse_decode() {
+        let decoder = Decoder::Fuse;
+        let tokens = vec!["Hello".to_string(), " ".to_string(), "World".to_string()];
+        assert_eq!(decoder.decode(&tokens), "Hello World");
+    }
+
+    #[test]
+    fn test_strip_decode() {
+        let decoder = Decoder::Strip {
+            content: '_',
+            start: 1,
+            stop: 1,
+        };
+        let tokens = vec!["_Hello_".to_string()];
+        assert_eq!(decoder.decode(&tokens), "Hello");
     }
 }
