@@ -13,8 +13,9 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+use std::time::Instant;
 
 /// GPT-2 style byte-to-unicode mapping
 fn bytes_to_unicode() -> HashMap<u8, char> {
@@ -404,7 +405,11 @@ impl InlBpeTrainer {
     /// Learn merges using heap for O(log n) best pair selection
     fn learn_merges_heap(&mut self, words: &mut Vec<Word>) {
         let target_vocab_size = self.config.vocab_size;
+        let initial_vocab_size = self.vocab.len();
+        let target_merges = target_vocab_size.saturating_sub(initial_vocab_size);
         let mut iteration = 0;
+        let start_time = Instant::now();
+        let mut last_progress_update = Instant::now();
 
         // Rebuild heap periodically (INL dynamics change scores)
         let rebuild_interval = 100;
@@ -464,8 +469,33 @@ impl InlBpeTrainer {
                 self.velocity.insert(new_id, (v_a + v_b) / 2.0);
 
                 iteration += 1;
-                if iteration % 1000 == 0 {
-                    println!("  Vocab size: {} ({} merges)", self.vocab.len(), iteration);
+
+                // Progress bar update (every 100ms or every 100 merges)
+                let should_update = last_progress_update.elapsed().as_millis() >= 100
+                    || iteration % 100 == 0;
+
+                if should_update && target_merges > 0 {
+                    let progress = iteration as f64 / target_merges as f64;
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let eta = if progress > 0.0 {
+                        (elapsed / progress) - elapsed
+                    } else {
+                        0.0
+                    };
+
+                    let bar_width = 30;
+                    let filled = (progress * bar_width as f64).min(bar_width as f64) as usize;
+                    let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+
+                    eprint!(
+                        "\r  [{bar}] {}/{} ({:.1}%) | ETA: {:.0}s    ",
+                        iteration,
+                        target_merges,
+                        (progress * 100.0).min(100.0),
+                        eta
+                    );
+                    let _ = io::stderr().flush();
+                    last_progress_update = Instant::now();
                 }
             }
 
@@ -473,6 +503,16 @@ impl InlBpeTrainer {
                 break;
             }
         }
+
+        // Final progress update
+        let total_time = start_time.elapsed().as_secs_f64();
+        eprintln!(
+            "\r  [{}] {}/{} (100.0%) | Done in {:.1}s    ",
+            "█".repeat(30),
+            iteration,
+            target_merges,
+            total_time
+        );
     }
 
     /// Apply merge with PARALLEL incremental pair frequency updates

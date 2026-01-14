@@ -6,6 +6,8 @@
 use hashbrown::HashMap;
 use rayon::prelude::*;
 use std::cmp::Ordering;
+use std::io::{self, Write};
+use std::time::Instant;
 
 /// BPE Trainer configuration
 #[derive(Debug, Clone)]
@@ -96,13 +98,31 @@ impl BpeTrainer {
     /// - vocab: HashMap<String, u32> mapping tokens to IDs
     /// - merges: Vec<(String, String)> list of merge operations in order
     pub fn train(&self, texts: &[&str]) -> (HashMap<String, u32>, Vec<(String, String)>) {
+        let start_time = Instant::now();
+
         // Step 1: Build initial word frequencies
+        if self.config.show_progress {
+            eprintln!("Step 1: Counting word frequencies...");
+        }
         let word_freqs = self.build_word_frequencies(texts);
+        if self.config.show_progress {
+            eprintln!("  Found {} unique words", word_freqs.len());
+        }
 
         // Step 2: Build initial character vocabulary
+        if self.config.show_progress {
+            eprintln!("Step 2: Building initial vocabulary...");
+        }
         let mut vocab = self.build_initial_vocab(&word_freqs);
+        let initial_vocab_size = vocab.len();
+        if self.config.show_progress {
+            eprintln!("  Initial vocab: {} tokens", initial_vocab_size);
+        }
 
         // Step 3: Split words into characters
+        if self.config.show_progress {
+            eprintln!("Step 3: Splitting words into tokens...");
+        }
         let mut word_splits: HashMap<String, Vec<String>> = word_freqs
             .keys()
             .map(|word| {
@@ -112,7 +132,13 @@ impl BpeTrainer {
             .collect();
 
         // Step 4: Iteratively merge most frequent pairs
+        let target_merges = self.config.vocab_size.saturating_sub(initial_vocab_size);
+        if self.config.show_progress {
+            eprintln!("Step 4: Learning {} BPE merges...", target_merges);
+        }
+
         let mut merges: Vec<(String, String)> = Vec::new();
+        let mut last_progress_update = Instant::now();
 
         while vocab.len() < self.config.vocab_size {
             // Count pair frequencies
@@ -153,13 +179,49 @@ impl BpeTrainer {
                 *splits = self.merge_pair(splits, &best_pair.0, &best_pair.1, &merged);
             }
 
-            if self.config.show_progress && merges.len() % 1000 == 0 {
-                eprintln!(
-                    "BPE training: {} merges, vocab size: {}",
-                    merges.len(),
-                    vocab.len()
-                );
+            // Progress bar update (every 100ms or every 100 merges)
+            if self.config.show_progress {
+                let should_update = last_progress_update.elapsed().as_millis() >= 100
+                    || merges.len() % 100 == 0;
+
+                if should_update {
+                    let progress = merges.len() as f64 / target_merges as f64;
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let eta = if progress > 0.0 {
+                        (elapsed / progress) - elapsed
+                    } else {
+                        0.0
+                    };
+
+                    let bar_width = 30;
+                    let filled = (progress * bar_width as f64) as usize;
+                    let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+
+                    eprint!(
+                        "\r  [{bar}] {}/{} ({:.1}%) | ETA: {:.0}s    ",
+                        merges.len(),
+                        target_merges,
+                        progress * 100.0,
+                        eta
+                    );
+                    let _ = io::stderr().flush();
+                    last_progress_update = Instant::now();
+                }
             }
+        }
+
+        if self.config.show_progress {
+            let total_time = start_time.elapsed().as_secs_f64();
+            eprintln!("\r  [{bar}] {}/{} (100.0%) | Done in {:.1}s    ",
+                bar = "█".repeat(30),
+                merges.len(),
+                target_merges,
+                total_time
+            );
+            eprintln!("Training complete!");
+            eprintln!("  Final vocab size: {}", vocab.len());
+            eprintln!("  Total merges: {}", merges.len());
+            eprintln!("  Total time: {:.1}s", total_time);
         }
 
         (vocab, merges)
