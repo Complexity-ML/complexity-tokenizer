@@ -168,13 +168,19 @@ mod tests {
         vocab.insert("hel".to_string(), 6);
         vocab.insert("hell".to_string(), 7);
         vocab.insert("hello".to_string(), 8);
+        vocab.insert("lo".to_string(), 9);
+        vocab.insert("llo".to_string(), 10);
 
+        // Merges ordered to produce "hello" as single token:
+        // h+e -> he, he+l -> hel, hel+l -> hell, hell+o -> hello
         let merges = vec![
-            ("h".to_string(), "e".to_string()),
-            ("l".to_string(), "l".to_string()),
-            ("he".to_string(), "l".to_string()),
-            ("hel".to_string(), "l".to_string()),
-            ("hell".to_string(), "o".to_string()),
+            ("h".to_string(), "e".to_string()),      // he (rank 0)
+            ("he".to_string(), "l".to_string()),     // hel (rank 1)
+            ("hel".to_string(), "l".to_string()),    // hell (rank 2)
+            ("hell".to_string(), "o".to_string()),   // hello (rank 3)
+            ("l".to_string(), "l".to_string()),      // ll (rank 4) - lower priority
+            ("l".to_string(), "o".to_string()),      // lo (rank 5)
+            ("l".to_string(), "lo".to_string()),     // llo (rank 6)
         ];
 
         let tokenizer = BpeTokenizer::new(vocab, merges);

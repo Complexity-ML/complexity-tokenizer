@@ -1,6 +1,6 @@
 [package]
 name = "complexity-tokenizer"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Complexity-ML"]
 description = "Fast BPE tokenizer in Rust with HuggingFace compatibility"
@@ -26,7 +26,7 @@ hashbrown = { version = "0.14", features = ["serde"] }
 ahash = "0.8"
 
 # Python bindings
-pyo3 = { version = "0.20", features = ["extension-module"] }
+pyo3 = { version = "0.23", features = ["extension-module"] }
 
 # HTTP for HuggingFace Hub
 ureq = { version = "2.9", features = ["json"] }

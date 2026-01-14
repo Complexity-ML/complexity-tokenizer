@@ -6,8 +6,11 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// GPT-2/GPT-4 style regex pattern for splitting
+/// Note: Original pattern uses look-ahead which is not supported by rust regex crate
+/// This simplified pattern handles most cases
 static GPT2_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
+    // Simplified pattern without look-ahead: contractions, words, numbers, punctuation, whitespace
+    Regex::new(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+")
         .unwrap()
 });
 

@@ -7,6 +7,8 @@
 //! - Fast inference (encode/decode)
 //! - INL-BPE training with dynamics-based merge selection
 //! - HuggingFace tokenizer.json compatibility
+//! - Full encoding with attention masks, token type IDs, offsets
+//! - Normalizers, pre-tokenizers, post-processors, decoders
 
 mod bpe;
 mod vocab;
@@ -15,6 +17,8 @@ mod trainer;
 mod normalizers;
 mod pretokenizers;
 mod postprocessors;
+mod decoders;
+mod encoding;
 
 pub use bpe::BpeTokenizer;
 pub use vocab::Vocab;
@@ -23,16 +27,24 @@ pub use trainer::{InlBpeTrainer, TrainerConfig};
 pub use normalizers::Normalizer;
 pub use pretokenizers::PreTokenizer;
 pub use postprocessors::{PostProcessor, TruncationStrategy, PaddingStrategy};
+pub use decoders::Decoder;
+pub use encoding::{Encoding, AddedToken};
 
 use pyo3::prelude::*;
+use pyo3::types::PyModule;
 use std::collections::HashMap as StdHashMap;
 
 /// Python module
 #[pymodule]
-fn complexity_tokenizer(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyTrainer>()?;
-    m.add("__version__", "0.2.1")?;
+    m.add_class::<PyEncoding>()?;
+    m.add_class::<PyNormalizer>()?;
+    m.add_class::<PyPreTokenizer>()?;
+    m.add_class::<PyPostProcessor>()?;
+    m.add_class::<PyDecoder>()?;
+    m.add("__version__", "0.2.2")?;
     Ok(())
 }
 
@@ -66,8 +78,9 @@ impl PyTokenizer {
     }
 
     /// Encode batch of texts (parallel)
-    fn encode_batch(&self, texts: Vec<&str>) -> PyResult<Vec<Vec<u32>>> {
-        Ok(self.inner.encode_batch(&texts))
+    fn encode_batch(&self, texts: Vec<String>) -> PyResult<Vec<Vec<u32>>> {
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        Ok(self.inner.encode_batch(&refs))
     }
 
     /// Decode token IDs to text
@@ -202,5 +215,325 @@ impl PyTrainer {
     #[getter]
     fn num_merges(&self) -> usize {
         self.inner.merges().len()
+    }
+}
+
+// =============================================================================
+// Encoding Python Bindings
+// =============================================================================
+
+/// Python-exposed Encoding class
+#[pyclass(name = "Encoding")]
+pub struct PyEncoding {
+    inner: Encoding,
+}
+
+#[pymethods]
+impl PyEncoding {
+    /// Create encoding from token IDs
+    #[staticmethod]
+    fn from_ids(ids: Vec<u32>, tokens: Vec<String>) -> Self {
+        Self {
+            inner: Encoding::from_ids(ids, tokens),
+        }
+    }
+
+    /// Get token IDs
+    #[getter]
+    fn ids(&self) -> Vec<u32> {
+        self.inner.ids.clone()
+    }
+
+    /// Get tokens as strings
+    #[getter]
+    fn tokens(&self) -> Vec<String> {
+        self.inner.tokens.clone()
+    }
+
+    /// Get attention mask
+    #[getter]
+    fn attention_mask(&self) -> Vec<u32> {
+        self.inner.attention_mask.clone()
+    }
+
+    /// Get token type IDs
+    #[getter]
+    fn type_ids(&self) -> Vec<u32> {
+        self.inner.type_ids.clone()
+    }
+
+    /// Get special tokens mask
+    #[getter]
+    fn special_tokens_mask(&self) -> Vec<u32> {
+        self.inner.special_tokens_mask.clone()
+    }
+
+    /// Get character offsets
+    #[getter]
+    fn offsets(&self) -> Vec<(usize, usize)> {
+        self.inner.offsets.clone()
+    }
+
+    /// Get length
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Pad encoding
+    fn pad(&mut self, target_length: usize, pad_id: u32, pad_token: &str, pad_left: bool) {
+        self.inner.pad(target_length, pad_id, pad_token, pad_left);
+    }
+
+    /// Truncate encoding
+    fn truncate(&mut self, max_length: usize) {
+        self.inner.truncate(max_length);
+    }
+}
+
+// =============================================================================
+// Normalizer Python Bindings
+// =============================================================================
+
+/// Python-exposed Normalizer class
+#[pyclass(name = "Normalizer")]
+pub struct PyNormalizer {
+    inner: Normalizer,
+}
+
+#[pymethods]
+impl PyNormalizer {
+    /// Create NFC normalizer
+    #[staticmethod]
+    fn nfc() -> Self {
+        Self { inner: Normalizer::NFC }
+    }
+
+    /// Create NFD normalizer
+    #[staticmethod]
+    fn nfd() -> Self {
+        Self { inner: Normalizer::NFD }
+    }
+
+    /// Create NFKC normalizer
+    #[staticmethod]
+    fn nfkc() -> Self {
+        Self { inner: Normalizer::NFKC }
+    }
+
+    /// Create NFKD normalizer
+    #[staticmethod]
+    fn nfkd() -> Self {
+        Self { inner: Normalizer::NFKD }
+    }
+
+    /// Create lowercase normalizer
+    #[staticmethod]
+    fn lowercase() -> Self {
+        Self { inner: Normalizer::Lowercase }
+    }
+
+    /// Create strip normalizer
+    #[staticmethod]
+    fn strip() -> Self {
+        Self { inner: Normalizer::Strip }
+    }
+
+    /// Create strip accents normalizer
+    #[staticmethod]
+    fn strip_accents() -> Self {
+        Self { inner: Normalizer::StripAccents }
+    }
+
+    /// Create replace normalizer
+    #[staticmethod]
+    fn replace(pattern: String, replacement: String) -> Self {
+        Self {
+            inner: Normalizer::Replace { pattern, replacement },
+        }
+    }
+
+    /// Normalize text
+    fn normalize(&self, text: &str) -> String {
+        self.inner.normalize(text)
+    }
+}
+
+// =============================================================================
+// PreTokenizer Python Bindings
+// =============================================================================
+
+/// Python-exposed PreTokenizer class
+#[pyclass(name = "PreTokenizer")]
+pub struct PyPreTokenizer {
+    inner: PreTokenizer,
+}
+
+#[pymethods]
+impl PyPreTokenizer {
+    /// Create whitespace pre-tokenizer
+    #[staticmethod]
+    fn whitespace() -> Self {
+        Self { inner: PreTokenizer::Whitespace }
+    }
+
+    /// Create ByteLevel pre-tokenizer (GPT-2 style)
+    #[staticmethod]
+    #[pyo3(signature = (add_prefix_space = false))]
+    fn byte_level(add_prefix_space: bool) -> Self {
+        Self {
+            inner: PreTokenizer::ByteLevel { add_prefix_space },
+        }
+    }
+
+    /// Create Metaspace pre-tokenizer (SentencePiece style)
+    #[staticmethod]
+    #[pyo3(signature = (replacement = '▁', add_prefix_space = true))]
+    fn metaspace(replacement: char, add_prefix_space: bool) -> Self {
+        Self {
+            inner: PreTokenizer::Metaspace { replacement, add_prefix_space },
+        }
+    }
+
+    /// Create punctuation pre-tokenizer
+    #[staticmethod]
+    fn punctuation() -> Self {
+        Self { inner: PreTokenizer::Punctuation }
+    }
+
+    /// Create digits pre-tokenizer
+    #[staticmethod]
+    #[pyo3(signature = (individual_digits = false))]
+    fn digits(individual_digits: bool) -> Self {
+        Self {
+            inner: PreTokenizer::Digits { individual_digits },
+        }
+    }
+
+    /// Create GPT-2 pre-tokenizer
+    #[staticmethod]
+    fn gpt2() -> Self {
+        Self { inner: PreTokenizer::GPT2 }
+    }
+
+    /// Pre-tokenize text
+    fn pre_tokenize(&self, text: &str) -> Vec<String> {
+        self.inner.pre_tokenize(text)
+    }
+}
+
+// =============================================================================
+// PostProcessor Python Bindings
+// =============================================================================
+
+/// Python-exposed PostProcessor class
+#[pyclass(name = "PostProcessor")]
+pub struct PyPostProcessor {
+    inner: PostProcessor,
+}
+
+#[pymethods]
+impl PyPostProcessor {
+    /// Create BERT post-processor
+    #[staticmethod]
+    fn bert(cls_token: String, cls_id: u32, sep_token: String, sep_id: u32) -> Self {
+        Self {
+            inner: PostProcessor::BertProcessing {
+                cls: (cls_token, cls_id),
+                sep: (sep_token, sep_id),
+            },
+        }
+    }
+
+    /// Create RoBERTa post-processor
+    #[staticmethod]
+    #[pyo3(signature = (bos_token, bos_id, eos_token, eos_id, add_prefix_space = false))]
+    fn roberta(bos_token: String, bos_id: u32, eos_token: String, eos_id: u32, add_prefix_space: bool) -> Self {
+        Self {
+            inner: PostProcessor::RobertaProcessing {
+                bos: (bos_token, bos_id),
+                eos: (eos_token, eos_id),
+                add_prefix_space,
+            },
+        }
+    }
+
+    /// Create template post-processor
+    #[staticmethod]
+    #[pyo3(signature = (single, pair = None, special_tokens = vec![]))]
+    fn template(single: String, pair: Option<String>, special_tokens: Vec<(String, u32)>) -> Self {
+        Self {
+            inner: PostProcessor::TemplateProcessing {
+                single,
+                pair,
+                special_tokens,
+            },
+        }
+    }
+
+    /// Process token IDs
+    #[pyo3(signature = (ids, pair_ids = None))]
+    fn process(&self, ids: Vec<u32>, pair_ids: Option<Vec<u32>>) -> Vec<u32> {
+        self.inner.process(ids, pair_ids)
+    }
+
+    /// Get number of added tokens for single sequence
+    fn added_tokens_single(&self) -> usize {
+        self.inner.added_tokens_single()
+    }
+
+    /// Get number of added tokens for pair sequence
+    fn added_tokens_pair(&self) -> usize {
+        self.inner.added_tokens_pair()
+    }
+}
+
+// =============================================================================
+// Decoder Python Bindings
+// =============================================================================
+
+/// Python-exposed Decoder class
+#[pyclass(name = "Decoder")]
+pub struct PyDecoder {
+    inner: Decoder,
+}
+
+#[pymethods]
+impl PyDecoder {
+    /// Create ByteLevel decoder (GPT-2 style)
+    #[staticmethod]
+    fn byte_level() -> Self {
+        Self { inner: Decoder::ByteLevel }
+    }
+
+    /// Create Metaspace decoder (SentencePiece style)
+    #[staticmethod]
+    #[pyo3(signature = (replacement = '▁', add_prefix_space = true))]
+    fn metaspace(replacement: char, add_prefix_space: bool) -> Self {
+        Self {
+            inner: Decoder::Metaspace { replacement, add_prefix_space },
+        }
+    }
+
+    /// Create WordPiece decoder (BERT style)
+    #[staticmethod]
+    #[pyo3(signature = (prefix = "##".to_string(), cleanup = true))]
+    fn wordpiece(prefix: String, cleanup: bool) -> Self {
+        Self {
+            inner: Decoder::WordPiece { prefix, cleanup },
+        }
+    }
+
+    /// Create BPE decoder
+    #[staticmethod]
+    #[pyo3(signature = (suffix = "</w>".to_string()))]
+    fn bpe(suffix: String) -> Self {
+        Self {
+            inner: Decoder::BPE { suffix },
+        }
+    }
+
+    /// Decode tokens to text
+    fn decode(&self, tokens: Vec<String>) -> String {
+        self.inner.decode(&tokens)
     }
 }
