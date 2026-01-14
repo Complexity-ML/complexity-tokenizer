@@ -65,6 +65,8 @@ pub struct InlBpeTrainer {
     velocity: HashMap<u32, f32>,
     // Optimization: global pair frequencies (incrementally updated)
     pair_freqs: HashMap<(u32, u32), i64>,  // i64 to handle decrements
+    // Streaming: accumulate word frequencies across batches
+    word_freqs_accumulator: HashMap<String, u32>,
 }
 
 impl InlBpeTrainer {
@@ -77,6 +79,7 @@ impl InlBpeTrainer {
             token_freqs: HashMap::new(),
             velocity: HashMap::new(),
             pair_freqs: HashMap::new(),
+            word_freqs_accumulator: HashMap::new(),
         }
     }
 
@@ -95,6 +98,33 @@ impl InlBpeTrainer {
     {
         println!("Step 1: Counting word frequencies from iterator...");
         let word_freqs = self.count_words_from_iter(texts);
+        println!("  Found {} unique words", word_freqs.len());
+        self.train_from_word_freqs(word_freqs);
+    }
+
+    /// Count words from a batch (for streaming - call multiple times, then call finish_training)
+    pub fn count_batch<I, S>(&mut self, texts: I)
+    where
+        I: Iterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for text in texts {
+            for word in text.as_ref().split_whitespace() {
+                if word.chars().count() >= self.config.min_word_length {
+                    *self.word_freqs_accumulator.entry(word.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    /// Finish training after counting all batches
+    pub fn finish_training(&mut self) {
+        // Take accumulated word freqs
+        let mut word_freqs = std::mem::take(&mut self.word_freqs_accumulator);
+
+        // Filter by min frequency
+        word_freqs.retain(|_, freq| *freq >= self.config.min_frequency);
+
         println!("  Found {} unique words", word_freqs.len());
         self.train_from_word_freqs(word_freqs);
     }

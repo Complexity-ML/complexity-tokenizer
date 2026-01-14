@@ -26,7 +26,7 @@ use std::collections::HashMap as StdHashMap;
 fn complexity_tokenizer(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyTrainer>()?;
-    m.add("__version__", "0.1.7")?;
+    m.add("__version__", "0.1.8")?;
     Ok(())
 }
 
@@ -164,6 +164,19 @@ impl PyTrainer {
     /// Train tokenizer from an iterator of text strings (for streaming datasets)
     fn train_from_iterator(&mut self, texts: Vec<String>) -> PyResult<()> {
         self.inner.train_from_texts(texts.iter().map(|s| s.as_str()));
+        Ok(())
+    }
+
+    /// Count words from a batch (streaming - low memory)
+    /// Call this multiple times with batches, then call finish_training()
+    fn count_batch(&mut self, texts: Vec<String>) -> PyResult<()> {
+        self.inner.count_batch(texts.iter().map(|s| s.as_str()));
+        Ok(())
+    }
+
+    /// Finish training after counting all batches
+    fn finish_training(&mut self) -> PyResult<()> {
+        self.inner.finish_training();
         Ok(())
     }
 
