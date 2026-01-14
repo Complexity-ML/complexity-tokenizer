@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "complexity-tokenizer"
-version = "0.3.1"
+version = "0.3.2"
 description = "Fast BPE tokenizer in Rust with HuggingFace compatibility"
 readme = "README.md"
 license = {text = "Apache-2.0"}

@@ -33,6 +33,12 @@ pub enum PreTokenizer {
     Split { pattern: String, invert: bool },
     /// GPT-2 style regex splitting
     GPT2,
+    /// BERT-style pre-tokenizer (whitespace + punctuation + chinese chars)
+    BertPreTokenizer,
+    /// Split on a specific character delimiter
+    CharDelimiterSplit { delimiter: char },
+    /// Split on Unicode script changes (Latin, Han, Hiragana, etc.)
+    UnicodeScripts,
     /// Sequence of pre-tokenizers
     Sequence(Vec<PreTokenizer>),
 }
@@ -69,6 +75,15 @@ impl PreTokenizer {
             }
             PreTokenizer::GPT2 => {
                 gpt2_pretokenize(text)
+            }
+            PreTokenizer::BertPreTokenizer => {
+                bert_pretokenize(text)
+            }
+            PreTokenizer::CharDelimiterSplit { delimiter } => {
+                char_delimiter_split(text, *delimiter)
+            }
+            PreTokenizer::UnicodeScripts => {
+                unicode_scripts_split(text)
             }
             PreTokenizer::Sequence(pretokenizers) => {
                 let mut words = vec![text.to_string()];
@@ -257,6 +272,159 @@ fn gpt2_pretokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// BERT-style pre-tokenization
+/// Splits on whitespace, punctuation, and isolates Chinese characters
+fn bert_pretokenize(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !current.is_empty() {
+                words.push(current.clone());
+                current.clear();
+            }
+        } else if is_chinese_char(c) {
+            // Chinese characters are always isolated
+            if !current.is_empty() {
+                words.push(current.clone());
+                current.clear();
+            }
+            words.push(c.to_string());
+        } else if c.is_ascii_punctuation() || is_unicode_punctuation(c) {
+            // Punctuation is isolated
+            if !current.is_empty() {
+                words.push(current.clone());
+                current.clear();
+            }
+            words.push(c.to_string());
+        } else {
+            current.push(c);
+        }
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words
+}
+
+/// Check if character is a Chinese character
+fn is_chinese_char(c: char) -> bool {
+    let code = c as u32;
+    matches!(code,
+        0x4E00..=0x9FFF |    // CJK Unified Ideographs
+        0x3400..=0x4DBF |    // CJK Unified Ideographs Extension A
+        0x20000..=0x2A6DF |  // CJK Unified Ideographs Extension B
+        0x2A700..=0x2B73F |  // CJK Unified Ideographs Extension C
+        0x2B740..=0x2B81F |  // CJK Unified Ideographs Extension D
+        0x2B820..=0x2CEAF |  // CJK Unified Ideographs Extension E
+        0x2CEB0..=0x2EBEF |  // CJK Unified Ideographs Extension F
+        0x30000..=0x3134F |  // CJK Unified Ideographs Extension G
+        0xF900..=0xFAFF |    // CJK Compatibility Ideographs
+        0x2F800..=0x2FA1F    // CJK Compatibility Ideographs Supplement
+    )
+}
+
+/// Split on a specific character delimiter
+fn char_delimiter_split(text: &str, delimiter: char) -> Vec<String> {
+    text.split(delimiter)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Split on Unicode script changes
+/// Groups consecutive characters from the same Unicode script together
+fn unicode_scripts_split(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut current_script: Option<UnicodeScript> = None;
+
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !current.is_empty() {
+                words.push(current.clone());
+                current.clear();
+                current_script = None;
+            }
+            continue;
+        }
+
+        let script = get_unicode_script(c);
+
+        if current_script.is_none() || current_script == Some(script) || script == UnicodeScript::Common {
+            current.push(c);
+            if current_script.is_none() && script != UnicodeScript::Common {
+                current_script = Some(script);
+            }
+        } else {
+            // Script change - start new word
+            if !current.is_empty() {
+                words.push(current.clone());
+                current.clear();
+            }
+            current.push(c);
+            current_script = Some(script);
+        }
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words
+}
+
+/// Unicode script categories (simplified)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum UnicodeScript {
+    Latin,
+    Greek,
+    Cyrillic,
+    Arabic,
+    Hebrew,
+    Han,
+    Hiragana,
+    Katakana,
+    Hangul,
+    Thai,
+    Common,  // Punctuation, numbers, etc.
+    Unknown,
+}
+
+/// Get the Unicode script for a character
+fn get_unicode_script(c: char) -> UnicodeScript {
+    let code = c as u32;
+    match code {
+        // Latin
+        0x0041..=0x007A | 0x00C0..=0x024F | 0x1E00..=0x1EFF => UnicodeScript::Latin,
+        // Greek
+        0x0370..=0x03FF | 0x1F00..=0x1FFF => UnicodeScript::Greek,
+        // Cyrillic
+        0x0400..=0x04FF | 0x0500..=0x052F => UnicodeScript::Cyrillic,
+        // Arabic
+        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF => UnicodeScript::Arabic,
+        // Hebrew
+        0x0590..=0x05FF => UnicodeScript::Hebrew,
+        // CJK/Han
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF => UnicodeScript::Han,
+        // Hiragana
+        0x3040..=0x309F => UnicodeScript::Hiragana,
+        // Katakana
+        0x30A0..=0x30FF | 0x31F0..=0x31FF => UnicodeScript::Katakana,
+        // Hangul
+        0xAC00..=0xD7AF | 0x1100..=0x11FF | 0x3130..=0x318F => UnicodeScript::Hangul,
+        // Thai
+        0x0E00..=0x0E7F => UnicodeScript::Thai,
+        // Common (punctuation, numbers, spaces)
+        0x0000..=0x0040 | 0x005B..=0x0060 | 0x007B..=0x00BF |
+        0x2000..=0x206F | 0x3000..=0x303F => UnicodeScript::Common,
+        _ => UnicodeScript::Unknown,
+    }
+}
+
 /// Default pre-tokenizer (ByteLevel)
 pub fn default_pretokenizer() -> PreTokenizer {
     PreTokenizer::ByteLevel { add_prefix_space: false }
@@ -301,5 +469,35 @@ mod tests {
         };
         let result = pt.pre_tokenize("hello world");
         assert!(result[0].starts_with('▁'));
+    }
+
+    #[test]
+    fn test_bert_pretokenizer() {
+        let pt = PreTokenizer::BertPreTokenizer;
+        let result = pt.pre_tokenize("Hello, world!");
+        assert_eq!(result, vec!["Hello", ",", "world", "!"]);
+    }
+
+    #[test]
+    fn test_bert_pretokenizer_chinese() {
+        let pt = PreTokenizer::BertPreTokenizer;
+        let result = pt.pre_tokenize("Hello世界");
+        assert_eq!(result, vec!["Hello", "世", "界"]);
+    }
+
+    #[test]
+    fn test_char_delimiter_split() {
+        let pt = PreTokenizer::CharDelimiterSplit { delimiter: '_' };
+        let result = pt.pre_tokenize("hello_world_test");
+        assert_eq!(result, vec!["hello", "world", "test"]);
+    }
+
+    #[test]
+    fn test_unicode_scripts() {
+        let pt = PreTokenizer::UnicodeScripts;
+        let result = pt.pre_tokenize("Helloこんにちは");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], "Hello");
+        assert_eq!(result[1], "こんにちは");
     }
 }

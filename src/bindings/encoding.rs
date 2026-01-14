@@ -107,6 +107,40 @@ impl PyEncoding {
         self.inner.token_to_sequence(token_idx)
     }
 
+    /// Get the token indices for a word
+    /// Returns (start, end) indices where start is inclusive and end is exclusive
+    fn word_to_tokens(&self, word_idx: usize) -> Option<(usize, usize)> {
+        self.inner.word_to_tokens(word_idx)
+    }
+
+    /// Get the token indices for a word in a specific sequence
+    #[pyo3(signature = (word_idx, sequence_id = 0))]
+    fn word_to_tokens_with_sequence(&self, word_idx: usize, sequence_id: usize) -> Option<(usize, usize)> {
+        self.inner.word_to_tokens_with_sequence(word_idx, sequence_id)
+    }
+
+    /// Get the character span for a word
+    fn word_to_chars(&self, word_idx: usize) -> Option<(usize, usize)> {
+        self.inner.word_to_chars(word_idx)
+    }
+
+    /// Get the character span for a word in a specific sequence
+    #[pyo3(signature = (word_idx, sequence_id = 0))]
+    fn word_to_chars_with_sequence(&self, word_idx: usize, sequence_id: usize) -> Option<(usize, usize)> {
+        self.inner.word_to_chars_with_sequence(word_idx, sequence_id)
+    }
+
+    /// Get all token indices for a word
+    fn word_token_indices(&self, word_idx: usize) -> Vec<usize> {
+        self.inner.word_token_indices(word_idx)
+    }
+
+    /// Get the number of words
+    #[getter]
+    fn n_words(&self) -> usize {
+        self.inner.n_words()
+    }
+
     fn ids_as_numpy<'py>(&self, py: Python<'py>) -> pyo3::Bound<'py, numpy::PyArray1<u32>> {
         numpy::PyArray1::from_vec(py, self.inner.ids.clone())
     }

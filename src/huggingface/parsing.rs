@@ -59,20 +59,27 @@ pub fn parse_normalizer(json: &Option<serde_json::Value>) -> Option<Normalizer> 
                     }
                     "BertNormalizer" => {
                         let lowercase = obj.get("lowercase").and_then(|v| v.as_bool()).unwrap_or(true);
-                        let strip_accents = obj.get("strip_accents").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let strip_accents = obj.get("strip_accents").and_then(|v| v.as_bool());
                         let clean_text = obj.get("clean_text").and_then(|v| v.as_bool()).unwrap_or(true);
+                        let handle_chinese_chars = obj.get("handle_chinese_chars").and_then(|v| v.as_bool()).unwrap_or(true);
 
-                        let mut normalizers = vec![Normalizer::NFC];
-                        if clean_text {
-                            normalizers.push(Normalizer::Strip);
-                        }
-                        if lowercase {
-                            normalizers.push(Normalizer::Lowercase);
-                        }
-                        if strip_accents {
-                            normalizers.push(Normalizer::StripAccents);
-                        }
-                        Some(Normalizer::Sequence(normalizers))
+                        Some(Normalizer::BertNormalizer {
+                            clean_text,
+                            handle_chinese_chars,
+                            strip_accents,
+                            lowercase,
+                        })
+                    }
+                    "Precompiled" => {
+                        // Parse precompiled charsmap
+                        let charsmap = obj.get("precompiled_charsmap")
+                            .and_then(|v| v.as_str())
+                            .map(|s| {
+                                // Simple parsing - in practice this would need more sophisticated handling
+                                vec![(s.to_string(), s.to_string())]
+                            })
+                            .unwrap_or_default();
+                        Some(Normalizer::Precompiled { charsmap })
                     }
                     _ => None,
                 };
@@ -114,7 +121,53 @@ pub fn parse_pre_tokenizer(json: &Option<serde_json::Value>) -> Option<PreTokeni
                         })
                     }
                     "Whitespace" => Some(PreTokenizer::Whitespace),
+                    "WhitespaceSplit" => Some(PreTokenizer::WhitespaceSplit),
                     "Punctuation" => Some(PreTokenizer::Punctuation),
+                    "BertPreTokenizer" => Some(PreTokenizer::BertPreTokenizer),
+                    "CharDelimiterSplit" => {
+                        let delimiter = obj
+                            .get("delimiter")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.chars().next())
+                            .unwrap_or(' ');
+                        Some(PreTokenizer::CharDelimiterSplit { delimiter })
+                    }
+                    "UnicodeScripts" => Some(PreTokenizer::UnicodeScripts),
+                    "Digits" => {
+                        let individual = obj
+                            .get("individual_digits")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        Some(PreTokenizer::Digits { individual_digits: individual })
+                    }
+                    "Split" => {
+                        let pattern = obj
+                            .get("pattern")
+                            .and_then(|v| v.get("Regex"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let invert = obj
+                            .get("invert")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        Some(PreTokenizer::Split { pattern, invert })
+                    }
+                    "Sequence" => {
+                        if let Some(pretokenizers) = obj.get("pretokenizers").and_then(|v| v.as_array()) {
+                            let parsed: Vec<PreTokenizer> = pretokenizers
+                                .iter()
+                                .filter_map(|p| parse_pre_tokenizer(&Some(p.clone())))
+                                .collect();
+                            if !parsed.is_empty() {
+                                Some(PreTokenizer::Sequence(parsed))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
                     _ => None,
                 };
             }

@@ -69,6 +69,17 @@ pub struct AddedToken {
 // Main Tokenizer Struct
 // =============================================================================
 
+/// Internal representation of an added token with its behavior flags
+#[derive(Debug, Clone)]
+struct AddedTokenInternal {
+    id: u32,
+    special: bool,
+    single_word: bool,
+    lstrip: bool,
+    rstrip: bool,
+    normalized: bool,
+}
+
 /// HuggingFace compatible tokenizer
 #[derive(Debug, Clone)]
 pub struct HuggingFaceTokenizer {
@@ -76,6 +87,7 @@ pub struct HuggingFaceTokenizer {
     vocab: Vocab,
     special_tokens: HashMap<String, u32>,
     added_tokens: HashMap<String, u32>,
+    added_tokens_config: HashMap<String, AddedTokenInternal>,
     normalizer: Option<Normalizer>,
     pre_tokenizer: Option<PreTokenizer>,
     post_processor: Option<PostProcessor>,
@@ -100,6 +112,20 @@ impl HuggingFaceTokenizer {
         let tokenizer_json: TokenizerJson = serde_json::from_reader(reader)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        Self::from_tokenizer_json(tokenizer_json)
+    }
+
+    /// Load from JSON string
+    pub fn from_str(json: &str) -> io::Result<Self> {
+        let tokenizer_json: TokenizerJson = serde_json::from_str(json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Self::from_tokenizer_json(tokenizer_json)
+    }
+
+    /// Load from bytes buffer
+    pub fn from_buffer(buffer: &[u8]) -> io::Result<Self> {
+        let tokenizer_json: TokenizerJson = serde_json::from_slice(buffer)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Self::from_tokenizer_json(tokenizer_json)
     }
 
@@ -193,8 +219,18 @@ impl HuggingFaceTokenizer {
         let mut special_token_map = HashMap::new();
         let mut added_tokens_map = HashMap::new();
 
+        let mut added_tokens_config = HashMap::new();
+
         for token in &json.added_tokens {
             added_tokens_map.insert(token.content.clone(), token.id);
+            added_tokens_config.insert(token.content.clone(), AddedTokenInternal {
+                id: token.id,
+                special: token.special,
+                single_word: token.single_word,
+                lstrip: token.lstrip,
+                rstrip: token.rstrip,
+                normalized: token.normalized,
+            });
 
             if token.special {
                 special_token_map.insert(token.content.clone(), token.id);
@@ -230,6 +266,7 @@ impl HuggingFaceTokenizer {
             vocab,
             special_tokens: special_token_map,
             added_tokens: added_tokens_map,
+            added_tokens_config,
             normalizer,
             pre_tokenizer,
             post_processor,
@@ -308,30 +345,37 @@ impl HuggingFaceTokenizer {
     }
 
     fn encode_single_to_encoding(&self, text: &str, type_id: u32) -> Encoding {
+        // Track original text positions
+        let original_text = text;
+
         let normalized = match &self.normalizer {
             Some(n) => n.normalize(text),
             None => text.to_string(),
         };
 
-        let words = match &self.pre_tokenizer {
-            Some(pt) => pt.pre_tokenize(&normalized),
-            None => vec![normalized],
-        };
+        // Pre-tokenize and track word boundaries in original text
+        let words_with_offsets = self.pre_tokenize_with_offsets(&normalized, original_text);
 
         let mut ids = Vec::new();
         let mut tokens = Vec::new();
         let mut offsets = Vec::new();
         let mut word_ids = Vec::new();
 
-        let mut char_offset = 0usize;
-        for (word_idx, word) in words.iter().enumerate() {
+        for (word_idx, (word, word_start, word_end)) in words_with_offsets.iter().enumerate() {
             let word_ids_part = self.bpe.encode(word);
+
+            // Calculate per-token offsets within the word
+            let mut token_char_offset = *word_start;
             for &id in &word_ids_part {
                 ids.push(id);
                 let token_str = self.vocab.get_token(id).unwrap_or("").to_string();
-                let token_len = token_str.len();
-                offsets.push((char_offset, char_offset + token_len));
-                char_offset += token_len;
+
+                // Calculate token length in original text (approximate)
+                let token_byte_len = token_str.len();
+                let token_end = (token_char_offset + token_byte_len).min(*word_end);
+
+                offsets.push((token_char_offset, token_end));
+                token_char_offset = token_end;
                 tokens.push(token_str);
                 word_ids.push(Some(word_idx));
             }
@@ -349,6 +393,39 @@ impl HuggingFaceTokenizer {
             sequence_ids: vec![Some(type_id as usize); len],
             overflowing: Vec::new(),
         }
+    }
+
+    /// Pre-tokenize and return words with their character offsets in the original text
+    fn pre_tokenize_with_offsets(&self, normalized: &str, original: &str) -> Vec<(String, usize, usize)> {
+        let words = match &self.pre_tokenizer {
+            Some(pt) => pt.pre_tokenize(normalized),
+            None => vec![normalized.to_string()],
+        };
+
+        // Try to map words back to original text positions
+        let mut result = Vec::new();
+        let mut search_start = 0;
+
+        for word in words {
+            // Find word in original text (starting from where we left off)
+            let word_trimmed = word.trim_start_matches(|c: char| c == 'Ġ' || c == '▁');
+            let word_to_find = if word_trimmed.is_empty() { &word } else { word_trimmed };
+
+            if let Some(pos) = original[search_start..].find(word_to_find) {
+                let start = search_start + pos;
+                let end = start + word_to_find.len();
+                result.push((word.clone(), start, end));
+                search_start = end;
+            } else {
+                // Fallback: use position based on accumulated length
+                let start = search_start;
+                let end = (start + word.len()).min(original.len());
+                result.push((word.clone(), start, end));
+                search_start = end;
+            }
+        }
+
+        result
     }
 
     pub fn encode_batch_to_encoding(&self, texts: &[&str]) -> Vec<Encoding> {
@@ -427,32 +504,105 @@ impl HuggingFaceTokenizer {
 
         while !remaining.is_empty() {
             let mut found_special = false;
+            let mut best_match: Option<(&str, u32, usize)> = None;
+
             for (token, &id) in &self.added_tokens {
-                if remaining.starts_with(token) {
-                    result.push(id);
-                    remaining = &remaining[token.len()..];
-                    found_special = true;
-                    break;
+                if let Some(config) = self.added_tokens_config.get(token) {
+                    // Check for match with proper lstrip/rstrip/single_word handling
+                    if let Some(pos) = self.find_added_token(remaining, token, config) {
+                        if pos == 0 {
+                            // Direct match at start
+                            if best_match.is_none() || token.len() > best_match.unwrap().0.len() {
+                                best_match = Some((token, id, token.len()));
+                            }
+                        }
+                    }
+                } else if remaining.starts_with(token) {
+                    if best_match.is_none() || token.len() > best_match.unwrap().0.len() {
+                        best_match = Some((token, id, token.len()));
+                    }
                 }
             }
 
+            if let Some((_, id, len)) = best_match {
+                result.push(id);
+                remaining = &remaining[len..];
+                found_special = true;
+            }
+
             if !found_special {
-                let next_special_pos = self
-                    .added_tokens
-                    .keys()
-                    .filter_map(|t| remaining.find(t))
-                    .min()
-                    .unwrap_or(remaining.len());
+                let next_special_pos = self.find_next_added_token_pos(remaining);
 
                 if next_special_pos > 0 {
                     let chunk = &remaining[..next_special_pos];
                     result.extend(self.bpe.encode(chunk));
                     remaining = &remaining[next_special_pos..];
+                } else if next_special_pos == 0 {
+                    // Shouldn't happen, but safety net
+                    break;
                 }
             }
         }
 
         result
+    }
+
+    /// Find an added token considering lstrip/rstrip/single_word flags
+    fn find_added_token(&self, text: &str, token: &str, config: &AddedTokenInternal) -> Option<usize> {
+        let pos = text.find(token)?;
+
+        // Check single_word constraint
+        if config.single_word {
+            // Token must be surrounded by word boundaries
+            let before_ok = pos == 0 || {
+                let before_char = text[..pos].chars().last();
+                before_char.map_or(true, |c| !c.is_alphanumeric())
+            };
+
+            let after_ok = pos + token.len() >= text.len() || {
+                let after_char = text[pos + token.len()..].chars().next();
+                after_char.map_or(true, |c| !c.is_alphanumeric())
+            };
+
+            if !before_ok || !after_ok {
+                return None;
+            }
+        }
+
+        // Check lstrip constraint (token should be preceded by whitespace or start)
+        if config.lstrip && pos > 0 {
+            let before_char = text[..pos].chars().last();
+            if !before_char.map_or(true, |c| c.is_whitespace()) {
+                return None;
+            }
+        }
+
+        // Check rstrip constraint (token should be followed by whitespace or end)
+        if config.rstrip && pos + token.len() < text.len() {
+            let after_char = text[pos + token.len()..].chars().next();
+            if !after_char.map_or(true, |c| c.is_whitespace()) {
+                return None;
+            }
+        }
+
+        Some(pos)
+    }
+
+    /// Find the position of the next added token in text
+    fn find_next_added_token_pos(&self, text: &str) -> usize {
+        let mut min_pos = text.len();
+
+        for (token, _) in &self.added_tokens {
+            if let Some(config) = self.added_tokens_config.get(token) {
+                if let Some(pos) = self.find_added_token(text, token, config) {
+                    min_pos = min_pos.min(pos);
+                }
+            } else if let Some(pos) = text.find(token) {
+                min_pos = min_pos.min(pos);
+            }
+        }
+
+        min_pos
     }
 
     pub fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<u32>> {
@@ -554,6 +704,38 @@ impl HuggingFaceTokenizer {
 
     pub fn add_token(&mut self, content: &str, id: u32, special: bool) {
         self.added_tokens.insert(content.to_string(), id);
+        self.added_tokens_config.insert(content.to_string(), AddedTokenInternal {
+            id,
+            special,
+            single_word: false,
+            lstrip: false,
+            rstrip: false,
+            normalized: !special,
+        });
+        if special {
+            self.special_tokens.insert(content.to_string(), id);
+        }
+    }
+
+    /// Add a token with full configuration
+    pub fn add_token_with_config(
+        &mut self,
+        content: &str,
+        id: u32,
+        special: bool,
+        single_word: bool,
+        lstrip: bool,
+        rstrip: bool,
+    ) {
+        self.added_tokens.insert(content.to_string(), id);
+        self.added_tokens_config.insert(content.to_string(), AddedTokenInternal {
+            id,
+            special,
+            single_word,
+            lstrip,
+            rstrip,
+            normalized: !special,
+        });
         if special {
             self.special_tokens.insert(content.to_string(), id);
         }
@@ -954,6 +1136,140 @@ impl HuggingFaceTokenizer {
     }
 
     // =========================================================================
+    // Training
+    // =========================================================================
+
+    /// Train a new tokenizer from texts using the same configuration
+    /// This keeps normalizer, pre_tokenizer, post_processor, decoder, and special tokens
+    /// but trains a new vocabulary from the provided texts
+    pub fn train_new_from_iterator<'a, I>(&self, texts: I, vocab_size: usize) -> io::Result<Self>
+    where
+        I: Iterator<Item = &'a str>,
+    {
+        use crate::bpe_trainer::{BpeTrainer, BpeTrainerConfig};
+
+        // Collect special tokens
+        let special_tokens: Vec<String> = self.all_special_tokens();
+
+        // Configure trainer
+        let config = BpeTrainerConfig {
+            vocab_size,
+            min_frequency: 2,
+            special_tokens: special_tokens.clone(),
+            show_progress: true,
+            end_of_word_suffix: None,
+            continuing_subword_prefix: None,
+            ..Default::default()
+        };
+
+        let trainer = BpeTrainer::new(config);
+
+        // Collect texts
+        let texts_vec: Vec<&str> = texts.collect();
+
+        // Pre-tokenize texts if we have a pre-tokenizer
+        let processed_texts: Vec<String> = if self.pre_tokenizer.is_some() {
+            texts_vec.iter()
+                .flat_map(|text| {
+                    let normalized = match &self.normalizer {
+                        Some(n) => n.normalize(text),
+                        None => text.to_string(),
+                    };
+                    match &self.pre_tokenizer {
+                        Some(pt) => pt.pre_tokenize(&normalized),
+                        None => vec![normalized],
+                    }
+                })
+                .collect()
+        } else {
+            texts_vec.iter().map(|s| s.to_string()).collect()
+        };
+
+        let refs: Vec<&str> = processed_texts.iter().map(|s| s.as_str()).collect();
+        let (vocab, merges) = trainer.train(&refs);
+
+        // Create new tokenizer with trained vocab
+        let bpe = crate::bpe::BpeTokenizer::new(vocab.clone(), merges);
+
+        // Rebuild special tokens map
+        let mut special_token_map = HashMap::new();
+        let mut added_tokens_map = HashMap::new();
+        let mut added_tokens_config = HashMap::new();
+
+        for token in &special_tokens {
+            if let Some(&id) = vocab.get(token) {
+                special_token_map.insert(token.clone(), id);
+                added_tokens_map.insert(token.clone(), id);
+                added_tokens_config.insert(token.clone(), AddedTokenInternal {
+                    id,
+                    special: true,
+                    single_word: false,
+                    lstrip: false,
+                    rstrip: false,
+                    normalized: false,
+                });
+            }
+        }
+
+        // Copy special tokens config from original
+        let vocab_obj = crate::vocab::Vocab::new(vocab, self.vocab.special_tokens().clone());
+
+        Ok(Self {
+            bpe,
+            vocab: vocab_obj,
+            special_tokens: special_token_map,
+            added_tokens: added_tokens_map,
+            added_tokens_config,
+            normalizer: self.normalizer.clone(),
+            pre_tokenizer: self.pre_tokenizer.clone(),
+            post_processor: self.post_processor.clone(),
+            decoder: self.decoder.clone(),
+            model_max_length: self.model_max_length,
+            padding_side: self.padding_side.clone(),
+            truncation_side: self.truncation_side.clone(),
+            chat_template: self.chat_template.clone(),
+            padding_config: self.padding_config.clone(),
+            truncation_config: self.truncation_config.clone(),
+        })
+    }
+
+    // =========================================================================
+    // Post-Processing
+    // =========================================================================
+
+    /// Apply post-processing to an encoding
+    /// This is a standalone method for applying post-processing separately
+    pub fn post_process(&self, encoding: Encoding, pair_encoding: Option<Encoding>) -> Encoding {
+        let mut result = encoding;
+
+        // Merge pair encoding if provided
+        if let Some(pair) = pair_encoding {
+            result.merge(pair, 1);
+        }
+
+        // Apply post-processor
+        if let Some(ref pp) = self.post_processor {
+            let original_len = result.ids.len();
+            let processed_ids = pp.process(result.ids.clone(), None);
+            let added_count = processed_ids.len() - original_len;
+
+            result.ids = processed_ids;
+            result.attention_mask.extend(std::iter::repeat(1).take(added_count));
+            result.special_tokens_mask.extend(std::iter::repeat(1).take(added_count));
+            result.type_ids.extend(std::iter::repeat(0).take(added_count));
+            result.offsets.extend(std::iter::repeat((0, 0)).take(added_count));
+            result.word_ids.extend(std::iter::repeat(None).take(added_count));
+            result.sequence_ids.extend(std::iter::repeat(None).take(added_count));
+
+            // Mark special tokens
+            let special_ids: Vec<u32> = self.special_tokens.values().copied().collect();
+            result.mark_special_tokens(&special_ids);
+        }
+
+        result
+    }
+
+    // =========================================================================
     // Chat Template
     // =========================================================================
 
@@ -1078,14 +1394,18 @@ impl HuggingFaceTokenizer {
         let added_tokens: Vec<AddedToken> = self
             .added_tokens
             .iter()
-            .map(|(content, &id)| AddedToken {
-                id,
-                content: content.clone(),
-                special: self.special_tokens.contains_key(content),
-                single_word: false,
-                lstrip: false,
-                rstrip: false,
-                normalized: false,
+            .map(|(content, &id)| {
+                // Get the config if available
+                let config = self.added_tokens_config.get(content);
+                AddedToken {
+                    id,
+                    content: content.clone(),
+                    special: config.map_or(self.special_tokens.contains_key(content), |c| c.special),
+                    single_word: config.map_or(false, |c| c.single_word),
+                    lstrip: config.map_or(false, |c| c.lstrip),
+                    rstrip: config.map_or(false, |c| c.rstrip),
+                    normalized: config.map_or(false, |c| c.normalized),
+                }
             })
             .collect();
 

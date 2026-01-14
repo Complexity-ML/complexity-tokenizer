@@ -56,6 +56,31 @@ impl PyNormalizer {
         }
     }
 
+    #[staticmethod]
+    #[pyo3(signature = (clean_text = true, handle_chinese_chars = true, strip_accents = None, lowercase = true))]
+    fn bert(
+        clean_text: bool,
+        handle_chinese_chars: bool,
+        strip_accents: Option<bool>,
+        lowercase: bool,
+    ) -> Self {
+        Self {
+            inner: Normalizer::BertNormalizer {
+                clean_text,
+                handle_chinese_chars,
+                strip_accents,
+                lowercase,
+            },
+        }
+    }
+
+    #[staticmethod]
+    fn precompiled(charsmap: Vec<(String, String)>) -> Self {
+        Self {
+            inner: Normalizer::Precompiled { charsmap },
+        }
+    }
+
     fn normalize(&self, text: &str) -> String {
         self.inner.normalize(text)
     }
@@ -106,6 +131,21 @@ impl PyPreTokenizer {
     #[staticmethod]
     fn gpt2() -> Self {
         Self { inner: PreTokenizer::GPT2 }
+    }
+
+    #[staticmethod]
+    fn bert() -> Self {
+        Self { inner: PreTokenizer::BertPreTokenizer }
+    }
+
+    #[staticmethod]
+    fn char_delimiter_split(delimiter: char) -> Self {
+        Self { inner: PreTokenizer::CharDelimiterSplit { delimiter } }
+    }
+
+    #[staticmethod]
+    fn unicode_scripts() -> Self {
+        Self { inner: PreTokenizer::UnicodeScripts }
     }
 
     fn pre_tokenize(&self, text: &str) -> Vec<String> {

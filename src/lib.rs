@@ -62,6 +62,6 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<bindings::PyWordLevelModel>()?;
     m.add_class::<bindings::PyCharBpeModel>()?;
     m.add_class::<bindings::PyByteLevelBpeModel>()?;
-    m.add("__version__", "0.3.1")?;
+    m.add("__version__", "0.3.2")?;
     Ok(())
 }

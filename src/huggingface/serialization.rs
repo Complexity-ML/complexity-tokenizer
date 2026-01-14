@@ -29,6 +29,20 @@ pub fn serialize_normalizer(normalizer: &Normalizer) -> serde_json::Value {
             "type": "Append",
             "append": append
         }),
+        Normalizer::BertNormalizer { clean_text, handle_chinese_chars, strip_accents, lowercase } => serde_json::json!({
+            "type": "BertNormalizer",
+            "clean_text": clean_text,
+            "handle_chinese_chars": handle_chinese_chars,
+            "strip_accents": strip_accents,
+            "lowercase": lowercase
+        }),
+        Normalizer::Precompiled { charsmap } => serde_json::json!({
+            "type": "Precompiled",
+            "precompiled_charsmap": charsmap.iter()
+                .map(|(from, to)| format!("{}:{}", from, to))
+                .collect::<Vec<_>>()
+                .join(",")
+        }),
         Normalizer::Sequence(normalizers) => serde_json::json!({
             "type": "Sequence",
             "normalizers": normalizers.iter().map(serialize_normalizer).collect::<Vec<_>>()
@@ -69,6 +83,12 @@ pub fn serialize_pre_tokenizer(pre_tokenizer: &PreTokenizer) -> serde_json::Valu
             "trim_offsets": true,
             "use_regex": true
         }),
+        PreTokenizer::BertPreTokenizer => serde_json::json!({"type": "BertPreTokenizer"}),
+        PreTokenizer::CharDelimiterSplit { delimiter } => serde_json::json!({
+            "type": "CharDelimiterSplit",
+            "delimiter": delimiter.to_string()
+        }),
+        PreTokenizer::UnicodeScripts => serde_json::json!({"type": "UnicodeScripts"}),
         PreTokenizer::Sequence(pretokenizers) => serde_json::json!({
             "type": "Sequence",
             "pretokenizers": pretokenizers.iter().map(serialize_pre_tokenizer).collect::<Vec<_>>()

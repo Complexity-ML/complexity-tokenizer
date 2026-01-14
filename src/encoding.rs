@@ -298,6 +298,99 @@ impl Encoding {
     pub fn token_to_sequence(&self, token_idx: usize) -> Option<usize> {
         self.sequence_ids.get(token_idx).and_then(|s| *s)
     }
+
+    /// Get the token indices for a word
+    /// Returns (start, end) indices where start is inclusive and end is exclusive
+    /// Useful for NER/POS tagging alignment
+    pub fn word_to_tokens(&self, word_idx: usize) -> Option<(usize, usize)> {
+        self.word_to_tokens_with_sequence(word_idx, 0)
+    }
+
+    /// Get the token indices for a word in a specific sequence
+    /// Returns (start, end) indices where start is inclusive and end is exclusive
+    pub fn word_to_tokens_with_sequence(&self, word_idx: usize, sequence_id: usize) -> Option<(usize, usize)> {
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+
+        for (i, word_id) in self.word_ids.iter().enumerate() {
+            if let Some(wid) = word_id {
+                // Check if this token belongs to the requested word and sequence
+                let in_sequence = self.sequence_ids
+                    .get(i)
+                    .and_then(|s| *s)
+                    .map_or(false, |s| s == sequence_id);
+
+                if *wid == word_idx && in_sequence {
+                    if start.is_none() {
+                        start = Some(i);
+                    }
+                    end = Some(i + 1);
+                }
+            }
+        }
+
+        match (start, end) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
+        }
+    }
+
+    /// Get the character span for a word
+    /// Returns (start, end) character positions
+    /// Useful for alignment with original text
+    pub fn word_to_chars(&self, word_idx: usize) -> Option<(usize, usize)> {
+        self.word_to_chars_with_sequence(word_idx, 0)
+    }
+
+    /// Get the character span for a word in a specific sequence
+    /// Returns (start, end) character positions
+    pub fn word_to_chars_with_sequence(&self, word_idx: usize, sequence_id: usize) -> Option<(usize, usize)> {
+        let token_range = self.word_to_tokens_with_sequence(word_idx, sequence_id)?;
+
+        let mut char_start: Option<usize> = None;
+        let mut char_end: Option<usize> = None;
+
+        for i in token_range.0..token_range.1 {
+            if let Some((start, end)) = self.offsets.get(i) {
+                if char_start.is_none() || *start < char_start.unwrap() {
+                    char_start = Some(*start);
+                }
+                if char_end.is_none() || *end > char_end.unwrap() {
+                    char_end = Some(*end);
+                }
+            }
+        }
+
+        match (char_start, char_end) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
+        }
+    }
+
+    /// Get all token indices that belong to a specific word
+    pub fn word_token_indices(&self, word_idx: usize) -> Vec<usize> {
+        self.word_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, wid)| {
+                if wid.as_ref() == Some(&word_idx) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get the number of words (unique word IDs)
+    pub fn n_words(&self) -> usize {
+        self.word_ids
+            .iter()
+            .filter_map(|w| *w)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0)
+    }
 }
 
 impl Default for Encoding {
@@ -438,5 +531,47 @@ mod tests {
         assert_eq!(enc.token_to_chars(0), Some((0, 5)));
         assert_eq!(enc.token_to_chars(1), Some((5, 10)));
         assert_eq!(enc.token_to_chars(2), None);
+    }
+
+    #[test]
+    fn test_word_to_tokens() {
+        let mut enc = Encoding::from_ids(
+            vec![1, 2, 3, 4],  // e.g., "hel", "lo", "wor", "ld"
+            vec!["hel".to_string(), "lo".to_string(), "wor".to_string(), "ld".to_string()],
+        );
+        enc.word_ids = vec![Some(0), Some(0), Some(1), Some(1)];  // 2 words, each split into 2 tokens
+
+        // Word 0 spans tokens 0-2 (exclusive)
+        assert_eq!(enc.word_to_tokens(0), Some((0, 2)));
+        // Word 1 spans tokens 2-4 (exclusive)
+        assert_eq!(enc.word_to_tokens(1), Some((2, 4)));
+        // Word 2 doesn't exist
+        assert_eq!(enc.word_to_tokens(2), None);
+    }
+
+    #[test]
+    fn test_word_to_chars() {
+        let mut enc = Encoding::from_ids(
+            vec![1, 2, 3, 4],
+            vec!["hel".to_string(), "lo".to_string(), "wor".to_string(), "ld".to_string()],
+        );
+        enc.word_ids = vec![Some(0), Some(0), Some(1), Some(1)];
+        enc.offsets = vec![(0, 3), (3, 5), (6, 9), (9, 11)];  // "hello world" positions
+
+        // Word 0 ("hello") spans chars 0-5
+        assert_eq!(enc.word_to_chars(0), Some((0, 5)));
+        // Word 1 ("world") spans chars 6-11
+        assert_eq!(enc.word_to_chars(1), Some((6, 11)));
+    }
+
+    #[test]
+    fn test_n_words() {
+        let mut enc = Encoding::from_ids(
+            vec![1, 2, 3, 4, 5],
+            vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string(), "e".to_string()],
+        );
+        enc.word_ids = vec![Some(0), Some(0), Some(1), Some(2), Some(2)];
+
+        assert_eq!(enc.n_words(), 3);
     }
 }
