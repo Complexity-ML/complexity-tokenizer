@@ -22,6 +22,8 @@ mod postprocessors;
 mod decoders;
 mod encoding;
 mod models;
+mod hub;
+mod bpe_trainer;
 
 pub use bpe::BpeTokenizer;
 pub use vocab::Vocab;
@@ -34,6 +36,8 @@ pub use postprocessors::{PostProcessor, TruncationStrategy, PaddingStrategy};
 pub use decoders::Decoder;
 pub use encoding::{Encoding, AddedToken};
 pub use models::{WordPieceModel, UnigramModel, WordLevelModel, CharBpeModel, ByteLevelBpeModel, Model};
+pub use hub::{HubConfig, download_tokenizer, resolve_model_path};
+pub use bpe_trainer::{BpeTrainer, BpeTrainerConfig, BpeTrainerBuilder};
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -46,6 +50,7 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTrainer>()?;
     m.add_class::<PyWordPieceTrainer>()?;
     m.add_class::<PyUnigramTrainer>()?;
+    m.add_class::<PyBpeTrainer>()?;
     m.add_class::<PyEncoding>()?;
     m.add_class::<PyNormalizer>()?;
     m.add_class::<PyPreTokenizer>()?;
@@ -56,7 +61,7 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWordLevelModel>()?;
     m.add_class::<PyCharBpeModel>()?;
     m.add_class::<PyByteLevelBpeModel>()?;
-    m.add("__version__", "0.2.7")?;
+    m.add("__version__", "0.2.8")?;
     Ok(())
 }
 
@@ -100,9 +105,64 @@ impl PyTokenizer {
         Ok(self.inner.decode(&ids))
     }
 
+    /// Decode with options (skip_special_tokens, clean_up_tokenization_spaces)
+    #[pyo3(signature = (ids, skip_special_tokens = false, clean_up_tokenization_spaces = true))]
+    fn decode_with_options(
+        &self,
+        ids: Vec<u32>,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> PyResult<String> {
+        Ok(self.inner.decode_with_options(&ids, skip_special_tokens, clean_up_tokenization_spaces))
+    }
+
     /// Decode batch of token IDs (parallel)
     fn decode_batch(&self, batch: Vec<Vec<u32>>) -> PyResult<Vec<String>> {
         Ok(self.inner.decode_batch(&batch))
+    }
+
+    /// Decode batch with options (parallel)
+    #[pyo3(signature = (batch, skip_special_tokens = false, clean_up_tokenization_spaces = true))]
+    fn decode_batch_with_options(
+        &self,
+        batch: Vec<Vec<u32>>,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> PyResult<Vec<String>> {
+        Ok(self.inner.decode_batch_with_options(&batch, skip_special_tokens, clean_up_tokenization_spaces))
+    }
+
+    /// Convert tokens to string
+    fn convert_tokens_to_string(&self, tokens: Vec<String>) -> String {
+        self.inner.convert_tokens_to_string(&tokens)
+    }
+
+    /// Get special tokens mask
+    #[pyo3(signature = (ids, already_has_special_tokens = true))]
+    fn get_special_tokens_mask(&self, ids: Vec<u32>, already_has_special_tokens: bool) -> Vec<u32> {
+        self.inner.get_special_tokens_mask(&ids, already_has_special_tokens)
+    }
+
+    /// Get number of special tokens that would be added
+    #[pyo3(signature = (is_pair = false))]
+    fn num_special_tokens_to_add(&self, is_pair: bool) -> usize {
+        self.inner.num_special_tokens_to_add(is_pair)
+    }
+
+    /// Check if this is a fast tokenizer (always true)
+    #[getter]
+    fn is_fast(&self) -> bool {
+        self.inner.is_fast()
+    }
+
+    /// Alias for encode_to_encoding (HuggingFace compatibility)
+    fn encode_plus(&self, text: &str) -> PyEncoding {
+        self.encode_to_encoding(text)
+    }
+
+    /// Batch encode_plus (HuggingFace compatibility)
+    fn batch_encode_plus(&self, texts: Vec<String>) -> Vec<PyEncoding> {
+        self.encode_batch_to_encoding(texts)
     }
 
     /// Get vocabulary size
@@ -472,6 +532,26 @@ impl PyEncoding {
     /// Get the sequence ID for a token
     fn token_to_sequence(&self, token_idx: usize) -> Option<usize> {
         self.inner.token_to_sequence(token_idx)
+    }
+
+    /// Get token IDs as numpy array
+    fn ids_as_numpy<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArray1<u32>> {
+        numpy::PyArray1::from_vec(py, self.inner.ids.clone())
+    }
+
+    /// Get attention mask as numpy array
+    fn attention_mask_as_numpy<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArray1<u32>> {
+        numpy::PyArray1::from_vec(py, self.inner.attention_mask.clone())
+    }
+
+    /// Get token type IDs as numpy array
+    fn type_ids_as_numpy<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArray1<u32>> {
+        numpy::PyArray1::from_vec(py, self.inner.type_ids.clone())
+    }
+
+    /// Get special tokens mask as numpy array
+    fn special_tokens_mask_as_numpy<'py>(&self, py: Python<'py>) -> Bound<'py, numpy::PyArray1<u32>> {
+        numpy::PyArray1::from_vec(py, self.inner.special_tokens_mask.clone())
     }
 }
 
@@ -1118,5 +1198,79 @@ impl PyUnigramTrainer {
     #[getter]
     fn vocab_size(&self) -> usize {
         self.inner.vocab().len()
+    }
+}
+
+// =============================================================================
+// BPE Trainer Python Bindings
+// =============================================================================
+
+/// Python-exposed BPE trainer class
+#[pyclass(name = "BpeTrainer")]
+pub struct PyBpeTrainer {
+    inner: BpeTrainer,
+}
+
+#[pymethods]
+impl PyBpeTrainer {
+    /// Create new BPE trainer
+    #[new]
+    #[pyo3(signature = (
+        vocab_size = 30000,
+        min_frequency = 2,
+        special_tokens = None,
+        show_progress = true,
+        end_of_word_suffix = None,
+        continuing_subword_prefix = None
+    ))]
+    fn new(
+        vocab_size: usize,
+        min_frequency: u32,
+        special_tokens: Option<Vec<String>>,
+        show_progress: bool,
+        end_of_word_suffix: Option<String>,
+        continuing_subword_prefix: Option<String>,
+    ) -> Self {
+        let config = BpeTrainerConfig {
+            vocab_size,
+            min_frequency,
+            special_tokens: special_tokens.unwrap_or_else(|| vec![
+                "<unk>".to_string(),
+                "<pad>".to_string(),
+                "<s>".to_string(),
+                "</s>".to_string(),
+            ]),
+            show_progress,
+            end_of_word_suffix,
+            continuing_subword_prefix,
+            ..Default::default()
+        };
+        Self {
+            inner: BpeTrainer::new(config),
+        }
+    }
+
+    /// Train BPE tokenizer from text strings
+    /// Returns (vocab, merges) tuple
+    fn train(&self, texts: Vec<String>) -> PyResult<(StdHashMap<String, u32>, Vec<(String, String)>)> {
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let (vocab, merges) = self.inner.train(&refs);
+
+        // Convert hashbrown HashMap to std HashMap
+        let std_vocab: StdHashMap<String, u32> = vocab.into_iter().collect();
+
+        Ok((std_vocab, merges))
+    }
+
+    /// Get target vocabulary size
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.config().vocab_size
+    }
+
+    /// Get minimum frequency
+    #[getter]
+    fn min_frequency(&self) -> u32 {
+        self.inner.config().min_frequency
     }
 }

@@ -441,22 +441,163 @@ impl HuggingFaceTokenizer {
 
     /// Decode token IDs to text
     pub fn decode(&self, ids: &[u32]) -> String {
+        self.decode_impl(ids, false, true)
+    }
+
+    /// Decode with option to skip special tokens
+    pub fn decode_with_options(
+        &self,
+        ids: &[u32],
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> String {
+        self.decode_impl(ids, skip_special_tokens, clean_up_tokenization_spaces)
+    }
+
+    /// Internal decode implementation
+    fn decode_impl(
+        &self,
+        ids: &[u32],
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> String {
+        // Filter out special tokens if requested
+        let ids_to_decode: Vec<u32> = if skip_special_tokens {
+            ids.iter()
+                .copied()
+                .filter(|&id| {
+                    if let Some(token) = self.vocab.get_token(id) {
+                        !self.special_tokens.contains_key(token)
+                    } else {
+                        true
+                    }
+                })
+                .collect()
+        } else {
+            ids.to_vec()
+        };
+
         // Get tokens from IDs
-        let tokens: Vec<String> = ids
+        let tokens: Vec<String> = ids_to_decode
             .iter()
             .filter_map(|&id| self.vocab.get_token(id).map(|s| s.to_string()))
             .collect();
 
         // Apply decoder if set
-        match &self.decoder {
+        let text = match &self.decoder {
             Some(d) => d.decode(&tokens),
-            None => self.bpe.decode(ids),
+            None => self.bpe.decode(&ids_to_decode),
+        };
+
+        // Clean up tokenization spaces if requested
+        if clean_up_tokenization_spaces {
+            self.clean_up_tokenization_spaces(&text)
+        } else {
+            text
         }
+    }
+
+    /// Clean up tokenization artifacts
+    pub fn clean_up_tokenization_spaces(&self, text: &str) -> String {
+        text
+            // Remove spaces before punctuation
+            .replace(" .", ".")
+            .replace(" ,", ",")
+            .replace(" !", "!")
+            .replace(" ?", "?")
+            .replace(" :", ":")
+            .replace(" ;", ";")
+            // Remove spaces inside quotes
+            .replace("\" ", "\"")
+            .replace(" \"", "\"")
+            .replace("' ", "'")
+            .replace(" '", "'")
+            // Remove spaces around parentheses
+            .replace("( ", "(")
+            .replace(" )", ")")
+            .replace("[ ", "[")
+            .replace(" ]", "]")
+            // Remove spaces around hyphens in words
+            .replace(" - ", "-")
+            // Normalize multiple spaces
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Decode batch (parallel)
     pub fn decode_batch(&self, batch: &[Vec<u32>]) -> Vec<String> {
         batch.par_iter().map(|ids| self.decode(ids)).collect()
+    }
+
+    /// Decode batch with options (parallel)
+    pub fn decode_batch_with_options(
+        &self,
+        batch: &[Vec<u32>],
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> Vec<String> {
+        batch
+            .par_iter()
+            .map(|ids| self.decode_with_options(ids, skip_special_tokens, clean_up_tokenization_spaces))
+            .collect()
+    }
+
+    /// Convert a list of tokens to a single string
+    pub fn convert_tokens_to_string(&self, tokens: &[String]) -> String {
+        match &self.decoder {
+            Some(d) => d.decode(tokens),
+            None => tokens.join(""),
+        }
+    }
+
+    /// Get the special tokens mask for a list of token IDs
+    /// Returns a vector of 1s for special tokens and 0s for regular tokens
+    pub fn get_special_tokens_mask(&self, ids: &[u32], already_has_special_tokens: bool) -> Vec<u32> {
+        if already_has_special_tokens {
+            ids.iter()
+                .map(|&id| {
+                    if let Some(token) = self.vocab.get_token(id) {
+                        if self.special_tokens.contains_key(token) {
+                            1
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                })
+                .collect()
+        } else {
+            // No special tokens added yet, return all zeros
+            vec![0; ids.len()]
+        }
+    }
+
+    /// Get the number of special tokens that would be added by the post-processor
+    pub fn num_special_tokens_to_add(&self, is_pair: bool) -> usize {
+        match &self.post_processor {
+            Some(PostProcessor::BertProcessing { .. }) => {
+                if is_pair { 3 } else { 2 } // [CLS] + [SEP] (+ [SEP] for pair)
+            }
+            Some(PostProcessor::RobertaProcessing { .. }) => {
+                if is_pair { 4 } else { 2 } // <s> + </s> (+ </s></s> for pair)
+            }
+            Some(PostProcessor::TemplateProcessing { single, pair, .. }) => {
+                let template = if is_pair { pair.as_ref().unwrap_or(single) } else { single };
+                // Count special tokens in template (tokens that don't start with $)
+                template
+                    .split_whitespace()
+                    .filter(|part| !part.starts_with('$'))
+                    .count()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Check if this is a fast tokenizer (always true for Rust implementation)
+    pub fn is_fast(&self) -> bool {
+        true
     }
 
     /// Get vocabulary size

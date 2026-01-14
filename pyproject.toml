@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "complexity-tokenizer"
-version = "0.2.7"
+version = "0.2.8"
 description = "Fast BPE tokenizer in Rust with HuggingFace compatibility"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -28,6 +28,7 @@ classifiers = [
     "Topic :: Text Processing :: Linguistic",
 ]
 requires-python = ">=3.8"
+dependencies = ["numpy>=1.20"]
 
 [project.urls]
 Homepage = "https://github.com/Complexity-ML/complexity-tokenizer"
