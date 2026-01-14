@@ -12,11 +12,17 @@ mod bpe;
 mod vocab;
 mod huggingface;
 mod trainer;
+mod normalizers;
+mod pretokenizers;
+mod postprocessors;
 
 pub use bpe::BpeTokenizer;
 pub use vocab::Vocab;
 pub use huggingface::HuggingFaceTokenizer;
 pub use trainer::{InlBpeTrainer, TrainerConfig};
+pub use normalizers::Normalizer;
+pub use pretokenizers::PreTokenizer;
+pub use postprocessors::{PostProcessor, TruncationStrategy, PaddingStrategy};
 
 use pyo3::prelude::*;
 use std::collections::HashMap as StdHashMap;
@@ -26,7 +32,7 @@ use std::collections::HashMap as StdHashMap;
 fn complexity_tokenizer(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyTrainer>()?;
-    m.add("__version__", "0.2.0")?;
+    m.add("__version__", "0.2.1")?;
     Ok(())
 }
 
