@@ -362,6 +362,158 @@ impl WordLevelModel {
 }
 
 // =============================================================================
+// CharBPE Model (character-level BPE with word boundary markers)
+// =============================================================================
+
+/// CharBPE tokenizer (original GPT-style with </w> suffix)
+#[derive(Debug, Clone)]
+pub struct CharBpeModel {
+    /// Token string -> ID
+    vocab: HashMap<String, u32>,
+    /// ID -> Token string
+    vocab_r: HashMap<u32, String>,
+    /// Merge operations in order: (pair_a, pair_b) -> merged
+    merges: Vec<((String, String), String)>,
+    /// Merge priority: (pair_a, pair_b) -> rank
+    merge_ranks: HashMap<(String, String), usize>,
+    /// Word-end suffix (usually "</w>")
+    end_of_word_suffix: String,
+    /// Unknown token
+    unk_token: String,
+}
+
+impl CharBpeModel {
+    /// Create new CharBPE model
+    pub fn new(
+        vocab: HashMap<String, u32>,
+        merges: Vec<(String, String)>,
+        end_of_word_suffix: String,
+        unk_token: String,
+    ) -> Self {
+        let vocab_r: HashMap<u32, String> = vocab.iter()
+            .map(|(k, v)| (*v, k.clone()))
+            .collect();
+
+        let mut merge_ops = Vec::new();
+        let mut merge_ranks = HashMap::new();
+
+        for (rank, (a, b)) in merges.iter().enumerate() {
+            let merged = format!("{}{}", a, b);
+            merge_ops.push(((a.clone(), b.clone()), merged));
+            merge_ranks.insert((a.clone(), b.clone()), rank);
+        }
+
+        Self {
+            vocab,
+            vocab_r,
+            merges: merge_ops,
+            merge_ranks,
+            end_of_word_suffix,
+            unk_token,
+        }
+    }
+
+    /// Tokenize a single word
+    fn tokenize_word(&self, word: &str) -> Vec<String> {
+        if word.is_empty() {
+            return vec![];
+        }
+
+        // Split into characters, add </w> suffix to last
+        let chars: Vec<char> = word.chars().collect();
+        let mut tokens: Vec<String> = chars[..chars.len()-1]
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+
+        // Last character gets the end-of-word suffix
+        if let Some(&last) = chars.last() {
+            tokens.push(format!("{}{}", last, self.end_of_word_suffix));
+        }
+
+        // Apply BPE merges
+        loop {
+            let mut best_merge: Option<(usize, usize, String)> = None;
+
+            for i in 0..tokens.len().saturating_sub(1) {
+                let pair = (tokens[i].clone(), tokens[i + 1].clone());
+                if let Some(&rank) = self.merge_ranks.get(&pair) {
+                    match &best_merge {
+                        None => {
+                            let merged = format!("{}{}", pair.0, pair.1);
+                            best_merge = Some((i, rank, merged));
+                        }
+                        Some((_, best_rank, _)) if rank < *best_rank => {
+                            let merged = format!("{}{}", pair.0, pair.1);
+                            best_merge = Some((i, rank, merged));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            match best_merge {
+                Some((idx, _, merged)) => {
+                    tokens[idx] = merged;
+                    tokens.remove(idx + 1);
+                }
+                None => break,
+            }
+        }
+
+        tokens
+    }
+
+    /// Encode text to token IDs
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        let unk_id = self.vocab.get(&self.unk_token).copied().unwrap_or(0);
+
+        text.split_whitespace()
+            .flat_map(|word| {
+                self.tokenize_word(word)
+                    .into_iter()
+                    .map(|t| self.vocab.get(&t).copied().unwrap_or(unk_id))
+            })
+            .collect()
+    }
+
+    /// Decode token IDs to text
+    pub fn decode(&self, ids: &[u32]) -> String {
+        let mut result = String::new();
+
+        for &id in ids {
+            if let Some(token) = self.vocab_r.get(&id) {
+                if token.ends_with(&self.end_of_word_suffix) {
+                    // Remove suffix and add space after
+                    let word_part = &token[..token.len() - self.end_of_word_suffix.len()];
+                    result.push_str(word_part);
+                    result.push(' ');
+                } else {
+                    result.push_str(token);
+                }
+            }
+        }
+
+        result.trim_end().to_string()
+    }
+
+    /// Get vocabulary size
+    pub fn vocab_size(&self) -> usize {
+        self.vocab.len()
+    }
+
+    /// Token to ID
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.vocab.get(token).copied()
+    }
+
+    /// ID to token
+    pub fn id_to_token(&self, id: u32) -> Option<&str> {
+        self.vocab_r.get(&id).map(|s| s.as_str())
+    }
+}
+
+// =============================================================================
 // Model Enum (unified interface)
 // =============================================================================
 
@@ -370,6 +522,8 @@ impl WordLevelModel {
 pub enum Model {
     /// BPE model (existing)
     BPE,
+    /// CharBPE model (original GPT-style)
+    CharBPE(CharBpeModel),
     /// WordPiece model (BERT)
     WordPiece(WordPieceModel),
     /// Unigram model (SentencePiece)
@@ -379,6 +533,21 @@ pub enum Model {
 }
 
 impl Model {
+    /// Create CharBPE model
+    pub fn char_bpe(
+        vocab: HashMap<String, u32>,
+        merges: Vec<(String, String)>,
+        suffix: &str,
+        unk_token: &str,
+    ) -> Self {
+        Model::CharBPE(CharBpeModel::new(
+            vocab,
+            merges,
+            suffix.to_string(),
+            unk_token.to_string(),
+        ))
+    }
+
     /// Create WordPiece model
     pub fn wordpiece(
         vocab: HashMap<String, u32>,
@@ -490,5 +659,26 @@ mod tests {
 
         let tokens = model.encode("hello unknown");
         assert_eq!(tokens, vec![1, 0]); // "unknown" -> <unk>
+    }
+
+    #[test]
+    fn test_char_bpe() {
+        let mut vocab = HashMap::new();
+        vocab.insert("<unk>".to_string(), 0);
+        vocab.insert("h".to_string(), 1);
+        vocab.insert("i</w>".to_string(), 2);
+        vocab.insert("hi</w>".to_string(), 3);
+
+        let merges = vec![
+            ("h".to_string(), "i</w>".to_string()),
+        ];
+
+        let model = CharBpeModel::new(vocab, merges, "</w>".to_string(), "<unk>".to_string());
+
+        let tokens = model.encode("hi");
+        assert_eq!(tokens, vec![3]); // "hi" merged
+
+        let decoded = model.decode(&tokens);
+        assert_eq!(decoded, "hi");
     }
 }

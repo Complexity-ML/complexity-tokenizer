@@ -15,6 +15,7 @@ mod bpe;
 mod vocab;
 mod huggingface;
 mod trainer;
+mod trainers;
 mod normalizers;
 mod pretokenizers;
 mod postprocessors;
@@ -26,12 +27,13 @@ pub use bpe::BpeTokenizer;
 pub use vocab::Vocab;
 pub use huggingface::HuggingFaceTokenizer;
 pub use trainer::{InlBpeTrainer, TrainerConfig};
+pub use trainers::{WordPieceTrainer, WordPieceTrainerConfig, UnigramTrainer, UnigramTrainerConfig};
 pub use normalizers::Normalizer;
 pub use pretokenizers::PreTokenizer;
 pub use postprocessors::{PostProcessor, TruncationStrategy, PaddingStrategy};
 pub use decoders::Decoder;
 pub use encoding::{Encoding, AddedToken};
-pub use models::{WordPieceModel, UnigramModel, WordLevelModel, Model};
+pub use models::{WordPieceModel, UnigramModel, WordLevelModel, CharBpeModel, Model};
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -42,6 +44,8 @@ use std::collections::HashMap as StdHashMap;
 fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTokenizer>()?;
     m.add_class::<PyTrainer>()?;
+    m.add_class::<PyWordPieceTrainer>()?;
+    m.add_class::<PyUnigramTrainer>()?;
     m.add_class::<PyEncoding>()?;
     m.add_class::<PyNormalizer>()?;
     m.add_class::<PyPreTokenizer>()?;
@@ -50,7 +54,8 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWordPieceModel>()?;
     m.add_class::<PyUnigramModel>()?;
     m.add_class::<PyWordLevelModel>()?;
-    m.add("__version__", "0.2.5")?;
+    m.add_class::<PyCharBpeModel>()?;
+    m.add("__version__", "0.2.6")?;
     Ok(())
 }
 
@@ -135,6 +140,47 @@ impl PyTokenizer {
         PyEncoding {
             inner: self.inner.encode_to_encoding(text),
         }
+    }
+
+    /// Encode text pair to full Encoding (for NLI, QA, etc.)
+    fn encode_pair_to_encoding(&self, text: &str, text_pair: &str) -> PyEncoding {
+        PyEncoding {
+            inner: self.inner.encode_pair_to_encoding(text, text_pair),
+        }
+    }
+
+    /// Encode with truncation and stride for long texts
+    #[pyo3(signature = (text, text_pair = None, max_length = 512, stride = 0))]
+    fn encode_with_truncation(
+        &self,
+        text: &str,
+        text_pair: Option<&str>,
+        max_length: usize,
+        stride: usize,
+    ) -> PyEncoding {
+        PyEncoding {
+            inner: self.inner.encode_to_encoding_with_truncation(text, text_pair, max_length, stride),
+        }
+    }
+
+    /// Encode batch of texts to full Encodings (parallel)
+    fn encode_batch_to_encoding(&self, texts: Vec<String>) -> Vec<PyEncoding> {
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        self.inner.encode_batch_to_encoding(&refs)
+            .into_iter()
+            .map(|e| PyEncoding { inner: e })
+            .collect()
+    }
+
+    /// Encode batch of text pairs to full Encodings (parallel)
+    fn encode_batch_pairs_to_encoding(&self, pairs: Vec<(String, String)>) -> Vec<PyEncoding> {
+        let refs: Vec<(&str, &str)> = pairs.iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        self.inner.encode_batch_pairs_to_encoding(&refs)
+            .into_iter()
+            .map(|e| PyEncoding { inner: e })
+            .collect()
     }
 
     /// Add a token dynamically
@@ -322,6 +368,27 @@ impl PyEncoding {
         self.inner.len()
     }
 
+    /// Get word IDs (which word each token belongs to)
+    #[getter]
+    fn word_ids(&self) -> Vec<Option<usize>> {
+        self.inner.word_ids.clone()
+    }
+
+    /// Get number of overflowing encodings
+    #[getter]
+    fn n_overflowing(&self) -> usize {
+        self.inner.n_overflowing()
+    }
+
+    /// Get overflowing encodings
+    #[getter]
+    fn overflowing(&self) -> Vec<PyEncoding> {
+        self.inner.overflowing()
+            .iter()
+            .map(|e| PyEncoding { inner: e.clone() })
+            .collect()
+    }
+
     /// Pad encoding
     fn pad(&mut self, target_length: usize, pad_id: u32, pad_token: &str, pad_left: bool) {
         self.inner.pad(target_length, pad_id, pad_token, pad_left);
@@ -330,6 +397,11 @@ impl PyEncoding {
     /// Truncate encoding
     fn truncate(&mut self, max_length: usize) {
         self.inner.truncate(max_length);
+    }
+
+    /// Truncate with stride (for long documents with overlap)
+    fn truncate_with_stride(&mut self, max_length: usize, stride: usize) {
+        self.inner.truncate_with_stride(max_length, stride);
     }
 }
 
@@ -729,5 +801,198 @@ impl PyWordLevelModel {
     /// ID to token
     fn id_to_token(&self, id: u32) -> Option<String> {
         self.inner.id_to_token(id).map(|s| s.to_string())
+    }
+}
+
+// =============================================================================
+// CharBPE Model Python Bindings
+// =============================================================================
+
+/// Python-exposed CharBPE model class
+#[pyclass(name = "CharBpeModel")]
+pub struct PyCharBpeModel {
+    inner: CharBpeModel,
+}
+
+#[pymethods]
+impl PyCharBpeModel {
+    /// Create new CharBPE model
+    #[new]
+    #[pyo3(signature = (vocab, merges, end_of_word_suffix = "</w>".to_string(), unk_token = "<unk>".to_string()))]
+    fn new(
+        vocab: StdHashMap<String, u32>,
+        merges: Vec<(String, String)>,
+        end_of_word_suffix: String,
+        unk_token: String,
+    ) -> Self {
+        let vocab_hash: hashbrown::HashMap<String, u32> = vocab.into_iter().collect();
+        Self {
+            inner: CharBpeModel::new(vocab_hash, merges, end_of_word_suffix, unk_token),
+        }
+    }
+
+    /// Encode text to token IDs
+    fn encode(&self, text: &str) -> Vec<u32> {
+        self.inner.encode(text)
+    }
+
+    /// Decode token IDs to text
+    fn decode(&self, ids: Vec<u32>) -> String {
+        self.inner.decode(&ids)
+    }
+
+    /// Get vocabulary size
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab_size()
+    }
+
+    /// Token to ID
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    /// ID to token
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id).map(|s| s.to_string())
+    }
+}
+
+// =============================================================================
+// WordPiece Trainer Python Bindings
+// =============================================================================
+
+/// Python-exposed WordPiece trainer class
+#[pyclass(name = "WordPieceTrainer")]
+pub struct PyWordPieceTrainer {
+    inner: WordPieceTrainer,
+}
+
+#[pymethods]
+impl PyWordPieceTrainer {
+    /// Create new WordPiece trainer
+    #[new]
+    #[pyo3(signature = (
+        vocab_size = 30000,
+        min_frequency = 2,
+        special_tokens = None,
+        continuing_subword_prefix = "##".to_string(),
+        max_input_chars_per_word = 100
+    ))]
+    fn new(
+        vocab_size: usize,
+        min_frequency: u32,
+        special_tokens: Option<Vec<String>>,
+        continuing_subword_prefix: String,
+        max_input_chars_per_word: usize,
+    ) -> Self {
+        let config = WordPieceTrainerConfig {
+            vocab_size,
+            min_frequency,
+            special_tokens: special_tokens.unwrap_or_else(|| vec![
+                "[PAD]".to_string(),
+                "[UNK]".to_string(),
+                "[CLS]".to_string(),
+                "[SEP]".to_string(),
+                "[MASK]".to_string(),
+            ]),
+            continuing_subword_prefix,
+            max_input_chars_per_word,
+            ..Default::default()
+        };
+        Self {
+            inner: WordPieceTrainer::new(config),
+        }
+    }
+
+    /// Train tokenizer from text files
+    fn train(&mut self, files: Vec<String>) -> PyResult<PyWordPieceModel> {
+        let paths: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let model = self.inner.train(&paths)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        Ok(PyWordPieceModel { inner: model })
+    }
+
+    /// Train tokenizer from an iterator of text strings
+    fn train_from_iterator(&mut self, texts: Vec<String>) -> PyResult<PyWordPieceModel> {
+        let model = self.inner.train_from_texts(texts.iter().map(|s| s.as_str()))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        Ok(PyWordPieceModel { inner: model })
+    }
+
+    /// Get vocabulary size
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab().len()
+    }
+}
+
+// =============================================================================
+// Unigram Trainer Python Bindings
+// =============================================================================
+
+/// Python-exposed Unigram trainer class
+#[pyclass(name = "UnigramTrainer")]
+pub struct PyUnigramTrainer {
+    inner: UnigramTrainer,
+}
+
+#[pymethods]
+impl PyUnigramTrainer {
+    /// Create new Unigram trainer
+    #[new]
+    #[pyo3(signature = (
+        vocab_size = 8000,
+        special_tokens = None,
+        initial_vocab_size = 1000000,
+        shrinking_factor = 0.75,
+        n_iterations = 16,
+        max_piece_length = 16
+    ))]
+    fn new(
+        vocab_size: usize,
+        special_tokens: Option<Vec<String>>,
+        initial_vocab_size: usize,
+        shrinking_factor: f64,
+        n_iterations: usize,
+        max_piece_length: usize,
+    ) -> Self {
+        let config = UnigramTrainerConfig {
+            vocab_size,
+            special_tokens: special_tokens.unwrap_or_else(|| vec![
+                "<unk>".to_string(),
+                "<s>".to_string(),
+                "</s>".to_string(),
+            ]),
+            initial_vocab_size,
+            shrinking_factor,
+            n_iterations,
+            max_piece_length,
+            ..Default::default()
+        };
+        Self {
+            inner: UnigramTrainer::new(config),
+        }
+    }
+
+    /// Train tokenizer from text files
+    fn train(&mut self, files: Vec<String>) -> PyResult<PyUnigramModel> {
+        let paths: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let model = self.inner.train(&paths)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        Ok(PyUnigramModel { inner: model })
+    }
+
+    /// Train tokenizer from an iterator of text strings
+    fn train_from_iterator(&mut self, texts: Vec<String>) -> PyResult<PyUnigramModel> {
+        let model = self.inner.train_from_texts(texts.iter().map(|s| s.as_str()))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        Ok(PyUnigramModel { inner: model })
+    }
+
+    /// Get vocabulary size
+    #[getter]
+    fn vocab_size(&self) -> usize {
+        self.inner.vocab().len()
     }
 }

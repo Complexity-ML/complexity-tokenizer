@@ -2,6 +2,30 @@
 
 use hashbrown::HashMap;
 use rayon::prelude::*;
+use std::cell::RefCell;
+
+thread_local! {
+    static RNG: RefCell<SimpleRng> = RefCell::new(SimpleRng::new(12345));
+}
+
+/// Simple PRNG for BPE dropout (no external dependency)
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        // xorshift64
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        (self.state as f32) / (u64::MAX as f32)
+    }
+}
 
 /// Merge operation (pair -> new token)
 #[derive(Debug, Clone)]
@@ -56,6 +80,12 @@ impl BpeTokenizer {
 
     /// Encode text to token IDs using BPE
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        self.encode_with_dropout(text, 0.0)
+    }
+
+    /// Encode text with BPE dropout (dropout probability 0.0-1.0)
+    /// BPE dropout randomly skips merges for regularization during training
+    pub fn encode_with_dropout(&self, text: &str, dropout: f32) -> Vec<u32> {
         if text.is_empty() {
             return vec![];
         }
@@ -73,7 +103,7 @@ impl BpeTokenizer {
         // Apply merges greedily
         loop {
             // Find best merge (lowest rank)
-            let best_merge = self.find_best_merge(&tokens);
+            let best_merge = self.find_best_merge_with_dropout(&tokens, dropout);
 
             match best_merge {
                 Some((idx, new_id)) => {
@@ -90,11 +120,24 @@ impl BpeTokenizer {
 
     /// Find the best merge to apply (lowest rank)
     fn find_best_merge(&self, tokens: &[u32]) -> Option<(usize, u32)> {
+        self.find_best_merge_with_dropout(tokens, 0.0)
+    }
+
+    /// Find the best merge with optional dropout
+    fn find_best_merge_with_dropout(&self, tokens: &[u32], dropout: f32) -> Option<(usize, u32)> {
         let mut best: Option<(usize, usize, u32)> = None; // (idx, rank, new_id)
 
         for i in 0..tokens.len().saturating_sub(1) {
             let pair = (tokens[i], tokens[i + 1]);
             if let Some(&rank) = self.merge_ranks.get(&pair) {
+                // BPE dropout: randomly skip this merge
+                if dropout > 0.0 {
+                    let skip = RNG.with(|rng| rng.borrow_mut().next_f32() < dropout);
+                    if skip {
+                        continue;
+                    }
+                }
+
                 let new_id = self.merges[rank].new_id;
                 match &best {
                     None => best = Some((i, rank, new_id)),
@@ -113,6 +156,13 @@ impl BpeTokenizer {
     pub fn encode_batch(&self, texts: &[&str]) -> Vec<Vec<u32>> {
         texts.par_iter()
             .map(|text| self.encode(text))
+            .collect()
+    }
+
+    /// Encode batch with dropout (parallel)
+    pub fn encode_batch_with_dropout(&self, texts: &[&str], dropout: f32) -> Vec<Vec<u32>> {
+        texts.par_iter()
+            .map(|text| self.encode_with_dropout(text, dropout))
             .collect()
     }
 

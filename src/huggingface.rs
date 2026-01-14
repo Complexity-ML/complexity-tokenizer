@@ -21,6 +21,7 @@ pub struct TokenizerJson {
     pub model: ModelJson,
     #[serde(default)]
     pub added_tokens: Vec<AddedToken>,
+    pub normalizer: Option<serde_json::Value>,
     pub pre_tokenizer: Option<serde_json::Value>,
     pub post_processor: Option<serde_json::Value>,
     pub decoder: Option<serde_json::Value>,
@@ -153,7 +154,7 @@ impl HuggingFaceTokenizer {
         let vocab = Vocab::new(json.model.vocab, special_tokens);
 
         // Parse pipeline components from JSON
-        let normalizer = parse_normalizer(&json.pre_tokenizer);
+        let normalizer = parse_normalizer(&json.normalizer);
         let pre_tokenizer = parse_pre_tokenizer(&json.pre_tokenizer);
         let post_processor = parse_post_processor(&json.post_processor, &special_token_map);
         let decoder = parse_decoder(&json.decoder);
@@ -172,6 +173,74 @@ impl HuggingFaceTokenizer {
 
     /// Encode text to full Encoding (with attention mask, type ids, etc.)
     pub fn encode_to_encoding(&self, text: &str) -> Encoding {
+        self.encode_to_encoding_impl(text, None, None, None)
+    }
+
+    /// Encode text pair to full Encoding (for NLI, QA, etc.)
+    pub fn encode_pair_to_encoding(&self, text: &str, text_pair: &str) -> Encoding {
+        self.encode_to_encoding_impl(text, Some(text_pair), None, None)
+    }
+
+    /// Encode with truncation and stride for long texts
+    pub fn encode_to_encoding_with_truncation(
+        &self,
+        text: &str,
+        text_pair: Option<&str>,
+        max_length: usize,
+        stride: usize,
+    ) -> Encoding {
+        self.encode_to_encoding_impl(text, text_pair, Some(max_length), Some(stride))
+    }
+
+    /// Internal encoding implementation
+    fn encode_to_encoding_impl(
+        &self,
+        text: &str,
+        text_pair: Option<&str>,
+        max_length: Option<usize>,
+        stride: Option<usize>,
+    ) -> Encoding {
+        // Encode first sequence
+        let mut encoding = self.encode_single_to_encoding(text, 0);
+
+        // Encode second sequence if provided
+        if let Some(pair) = text_pair {
+            let pair_encoding = self.encode_single_to_encoding(pair, 1);
+            encoding.merge(pair_encoding, 1);
+        }
+
+        // Post-process (add special tokens)
+        let processed_ids = match &self.post_processor {
+            Some(pp) => pp.process(encoding.ids.clone(), None),
+            None => encoding.ids.clone(),
+        };
+
+        // Update encoding with processed IDs
+        let added_count = processed_ids.len() - encoding.ids.len();
+        encoding.ids = processed_ids;
+
+        // Extend masks for added special tokens
+        encoding.attention_mask.extend(std::iter::repeat(1).take(added_count));
+        encoding.special_tokens_mask.extend(std::iter::repeat(1).take(added_count));
+        encoding.type_ids.extend(std::iter::repeat(0).take(added_count));
+
+        // Mark special tokens
+        let special_ids: Vec<u32> = self.special_tokens.values().copied().collect();
+        encoding.mark_special_tokens(&special_ids);
+
+        // Handle truncation with stride (for long texts)
+        if let Some(max_len) = max_length {
+            if encoding.len() > max_len {
+                let stride = stride.unwrap_or(0);
+                encoding.truncate_with_stride(max_len, stride);
+            }
+        }
+
+        encoding
+    }
+
+    /// Encode a single text to Encoding
+    fn encode_single_to_encoding(&self, text: &str, type_id: u32) -> Encoding {
         // Normalize
         let normalized = match &self.normalizer {
             Some(n) => n.normalize(text),
@@ -204,30 +273,29 @@ impl HuggingFaceTokenizer {
             }
         }
 
-        // Post-process (add special tokens)
-        let processed_ids = match &self.post_processor {
-            Some(pp) => pp.process(ids.clone(), None),
-            None => ids.clone(),
-        };
-
-        // Build full encoding
-        let len = processed_ids.len();
-        let mut encoding = Encoding {
-            ids: processed_ids,
-            type_ids: vec![0; len],
-            tokens: tokens.clone(),
+        let len = ids.len();
+        Encoding {
+            ids,
+            type_ids: vec![type_id; len],
+            tokens,
             attention_mask: vec![1; len],
             special_tokens_mask: vec![0; len],
             offsets,
             word_ids,
             overflowing: Vec::new(),
-        };
+        }
+    }
 
-        // Mark special tokens
-        let special_ids: Vec<u32> = self.special_tokens.values().copied().collect();
-        encoding.mark_special_tokens(&special_ids);
+    /// Encode batch of texts to full Encodings (parallel)
+    pub fn encode_batch_to_encoding(&self, texts: &[&str]) -> Vec<Encoding> {
+        texts.par_iter().map(|t| self.encode_to_encoding(t)).collect()
+    }
 
-        encoding
+    /// Encode batch of text pairs to full Encodings (parallel)
+    pub fn encode_batch_pairs_to_encoding(&self, pairs: &[(&str, &str)]) -> Vec<Encoding> {
+        pairs.par_iter()
+            .map(|(a, b)| self.encode_pair_to_encoding(a, b))
+            .collect()
     }
 
     /// Add a token dynamically
@@ -378,6 +446,7 @@ impl HuggingFaceTokenizer {
                 merges,
             },
             added_tokens,
+            normalizer: None,
             pre_tokenizer: None,
             post_processor: None,
             decoder: None,
@@ -395,8 +464,80 @@ impl HuggingFaceTokenizer {
 // =============================================================================
 
 /// Parse normalizer from JSON
-fn parse_normalizer(_json: &Option<serde_json::Value>) -> Option<Normalizer> {
-    // For now, default to NFC - can be extended to parse from JSON
+fn parse_normalizer(json: &Option<serde_json::Value>) -> Option<Normalizer> {
+    if let Some(value) = json {
+        if let Some(obj) = value.as_object() {
+            if let Some(type_val) = obj.get("type") {
+                let type_str = type_val.as_str().unwrap_or("");
+                return match type_str {
+                    "NFC" => Some(Normalizer::NFC),
+                    "NFD" => Some(Normalizer::NFD),
+                    "NFKC" => Some(Normalizer::NFKC),
+                    "NFKD" => Some(Normalizer::NFKD),
+                    "Lowercase" => Some(Normalizer::Lowercase),
+                    "Strip" => Some(Normalizer::Strip),
+                    "StripAccents" => Some(Normalizer::StripAccents),
+                    "Replace" => {
+                        let pattern = obj
+                            .get("pattern")
+                            .and_then(|v| v.get("String"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let replacement = obj
+                            .get("content")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Some(Normalizer::Replace { pattern, replacement })
+                    }
+                    "Prepend" => {
+                        let prepend = obj
+                            .get("prepend")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Some(Normalizer::Prepend(prepend))
+                    }
+                    "Sequence" => {
+                        if let Some(normalizers) = obj.get("normalizers").and_then(|v| v.as_array()) {
+                            let parsed: Vec<Normalizer> = normalizers
+                                .iter()
+                                .filter_map(|n| parse_normalizer(&Some(n.clone())))
+                                .collect();
+                            if !parsed.is_empty() {
+                                Some(Normalizer::Sequence(parsed))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    "BertNormalizer" => {
+                        // BERT normalizer: NFC + Lowercase (optionally) + StripAccents (optionally)
+                        let lowercase = obj.get("lowercase").and_then(|v| v.as_bool()).unwrap_or(true);
+                        let strip_accents = obj.get("strip_accents").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let clean_text = obj.get("clean_text").and_then(|v| v.as_bool()).unwrap_or(true);
+
+                        let mut normalizers = vec![Normalizer::NFC];
+                        if clean_text {
+                            normalizers.push(Normalizer::Strip);
+                        }
+                        if lowercase {
+                            normalizers.push(Normalizer::Lowercase);
+                        }
+                        if strip_accents {
+                            normalizers.push(Normalizer::StripAccents);
+                        }
+                        Some(Normalizer::Sequence(normalizers))
+                    }
+                    _ => None,
+                };
+            }
+        }
+    }
+    // Default to NFC if no normalizer specified
     Some(Normalizer::NFC)
 }
 

@@ -156,6 +156,66 @@ impl Encoding {
         self.word_ids.truncate(max_length);
     }
 
+    /// Truncate with stride - creates overlapping windows for long documents
+    pub fn truncate_with_stride(&mut self, max_length: usize, stride: usize) {
+        if self.len() <= max_length {
+            return;
+        }
+
+        // Create overlapping windows
+        let mut pos = max_length;
+        while pos < self.ids.len() {
+            let start = pos.saturating_sub(stride);
+            let end = (start + max_length).min(self.ids.len());
+
+            let overflow = Encoding {
+                ids: self.ids[start..end].to_vec(),
+                type_ids: self.type_ids[start..end].to_vec(),
+                tokens: self.tokens[start..end].to_vec(),
+                attention_mask: self.attention_mask[start..end].to_vec(),
+                special_tokens_mask: self.special_tokens_mask[start..end].to_vec(),
+                offsets: if self.offsets.len() > start {
+                    self.offsets[start..end.min(self.offsets.len())].to_vec()
+                } else {
+                    Vec::new()
+                },
+                word_ids: if self.word_ids.len() > start {
+                    self.word_ids[start..end.min(self.word_ids.len())].to_vec()
+                } else {
+                    Vec::new()
+                },
+                overflowing: Vec::new(),
+            };
+
+            self.overflowing.push(overflow);
+            pos = end;
+        }
+
+        // Truncate main encoding
+        self.ids.truncate(max_length);
+        self.type_ids.truncate(max_length);
+        self.tokens.truncate(max_length);
+        self.attention_mask.truncate(max_length);
+        self.special_tokens_mask.truncate(max_length);
+        self.offsets.truncate(max_length);
+        self.word_ids.truncate(max_length);
+    }
+
+    /// Get word IDs
+    pub fn word_ids(&self) -> &[Option<usize>] {
+        &self.word_ids
+    }
+
+    /// Get overflowing encodings
+    pub fn overflowing(&self) -> &[Encoding] {
+        &self.overflowing
+    }
+
+    /// Get the number of overflowing encodings
+    pub fn n_overflowing(&self) -> usize {
+        self.overflowing.len()
+    }
+
     /// Merge two encodings (for sequence pairs)
     pub fn merge(&mut self, other: Encoding, type_id: u32) {
         let _start = self.ids.len();
