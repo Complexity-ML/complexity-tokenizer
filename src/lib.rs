@@ -50,7 +50,7 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWordPieceModel>()?;
     m.add_class::<PyUnigramModel>()?;
     m.add_class::<PyWordLevelModel>()?;
-    m.add("__version__", "0.2.4")?;
+    m.add("__version__", "0.2.5")?;
     Ok(())
 }
 
