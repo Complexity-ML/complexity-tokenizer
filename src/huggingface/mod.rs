@@ -46,8 +46,58 @@ pub struct ModelJson {
     #[serde(rename = "type")]
     pub model_type: Option<String>,
     pub vocab: HashMap<String, u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_merges")]
     pub merges: Vec<String>,
+}
+
+/// Custom deserializer for merges that handles both string format and array format
+/// - String format: "Ġ t" (space-separated)
+/// - Array format: ["Ġ", "t"]
+fn deserialize_merges<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor, SeqAccess};
+    use std::fmt;
+
+    struct MergesVisitor;
+
+    impl<'de> Visitor<'de> for MergesVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a sequence of strings or arrays of two strings")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut merges = Vec::new();
+
+            while let Some(item) = seq.next_element::<serde_json::Value>()? {
+                match item {
+                    // String format: "Ġ t"
+                    serde_json::Value::String(s) => {
+                        merges.push(s);
+                    }
+                    // Array format: ["Ġ", "t"]
+                    serde_json::Value::Array(arr) => {
+                        if arr.len() == 2 {
+                            if let (Some(a), Some(b)) = (arr[0].as_str(), arr[1].as_str()) {
+                                merges.push(format!("{} {}", a, b));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(merges)
+        }
+    }
+
+    deserializer.deserialize_seq(MergesVisitor)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
