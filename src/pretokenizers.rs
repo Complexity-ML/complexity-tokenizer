@@ -153,21 +153,25 @@ pub fn bytes_to_unicode() -> std::collections::HashMap<u8, char> {
 }
 
 /// ByteLevel pre-tokenization (GPT-2 style)
+/// This uses the GPT2 regex pattern to split text, preserving spaces at the start of words,
+/// then encodes each byte using the GPT2 byte-to-unicode mapping.
 fn byte_level_pretokenize(text: &str, add_prefix_space: bool) -> Vec<String> {
     let byte_encoder = bytes_to_unicode();
     let mut words = Vec::new();
 
-    let text = if add_prefix_space && !text.starts_with(' ') {
+    // Optionally add prefix space
+    let text = if add_prefix_space && !text.is_empty() && !text.starts_with(' ') {
         format!(" {}", text)
     } else {
         text.to_string()
     };
 
-    for word in text.split_whitespace() {
-        // Prefix with Ġ (encoded space)
-        let word_with_space = format!("Ġ{}", word);
+    // Use GPT2 regex to split - this preserves spaces at the beginning of words
+    for mat in GPT2_PATTERN.find_iter(&text) {
+        let word = mat.as_str();
 
-        let encoded: String = word_with_space
+        // Encode each byte using GPT2 byte-to-unicode mapping
+        let encoded: String = word
             .bytes()
             .filter_map(|b| byte_encoder.get(&b).copied())
             .collect();
