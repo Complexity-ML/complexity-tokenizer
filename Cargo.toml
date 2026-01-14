@@ -1,6 +1,6 @@
 [package]
 name = "complexity-tokenizer"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 authors = ["Complexity-ML"]
 description = "Fast BPE tokenizer in Rust with HuggingFace compatibility"

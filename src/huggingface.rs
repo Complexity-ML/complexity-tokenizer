@@ -1,6 +1,11 @@
 //! HuggingFace tokenizer.json compatibility
 
 use crate::bpe::BpeTokenizer;
+use crate::decoders::Decoder;
+use crate::encoding::Encoding;
+use crate::normalizers::Normalizer;
+use crate::postprocessors::PostProcessor;
+use crate::pretokenizers::PreTokenizer;
 use crate::vocab::{SpecialTokens, Vocab};
 use hashbrown::HashMap;
 use rayon::prelude::*;
@@ -52,6 +57,14 @@ pub struct HuggingFaceTokenizer {
     vocab: Vocab,
     special_tokens: HashMap<String, u32>,
     added_tokens: HashMap<String, u32>,
+    /// Normalizer pipeline
+    normalizer: Option<Normalizer>,
+    /// Pre-tokenizer pipeline
+    pre_tokenizer: Option<PreTokenizer>,
+    /// Post-processor pipeline
+    post_processor: Option<PostProcessor>,
+    /// Decoder pipeline
+    decoder: Option<Decoder>,
 }
 
 impl HuggingFaceTokenizer {
@@ -139,12 +152,117 @@ impl HuggingFaceTokenizer {
         // Create vocab
         let vocab = Vocab::new(json.model.vocab, special_tokens);
 
+        // Parse pipeline components from JSON
+        let normalizer = parse_normalizer(&json.pre_tokenizer);
+        let pre_tokenizer = parse_pre_tokenizer(&json.pre_tokenizer);
+        let post_processor = parse_post_processor(&json.post_processor, &special_token_map);
+        let decoder = parse_decoder(&json.decoder);
+
         Ok(Self {
             bpe,
             vocab,
             special_tokens: special_token_map,
             added_tokens: added_tokens_map,
+            normalizer,
+            pre_tokenizer,
+            post_processor,
+            decoder,
         })
+    }
+
+    /// Encode text to full Encoding (with attention mask, type ids, etc.)
+    pub fn encode_to_encoding(&self, text: &str) -> Encoding {
+        // Normalize
+        let normalized = match &self.normalizer {
+            Some(n) => n.normalize(text),
+            None => text.to_string(),
+        };
+
+        // Pre-tokenize
+        let words = match &self.pre_tokenizer {
+            Some(pt) => pt.pre_tokenize(&normalized),
+            None => vec![normalized],
+        };
+
+        // BPE encode each word
+        let mut ids = Vec::new();
+        let mut tokens = Vec::new();
+        let mut offsets = Vec::new();
+        let mut word_ids = Vec::new();
+
+        let mut char_offset = 0usize;
+        for (word_idx, word) in words.iter().enumerate() {
+            let word_ids_part = self.bpe.encode(word);
+            for &id in &word_ids_part {
+                ids.push(id);
+                let token_str = self.vocab.get_token(id).unwrap_or("").to_string();
+                let token_len = token_str.len();
+                offsets.push((char_offset, char_offset + token_len));
+                char_offset += token_len;
+                tokens.push(token_str);
+                word_ids.push(Some(word_idx));
+            }
+        }
+
+        // Post-process (add special tokens)
+        let processed_ids = match &self.post_processor {
+            Some(pp) => pp.process(ids.clone(), None),
+            None => ids.clone(),
+        };
+
+        // Build full encoding
+        let len = processed_ids.len();
+        let mut encoding = Encoding {
+            ids: processed_ids,
+            type_ids: vec![0; len],
+            tokens: tokens.clone(),
+            attention_mask: vec![1; len],
+            special_tokens_mask: vec![0; len],
+            offsets,
+            word_ids,
+            overflowing: Vec::new(),
+        };
+
+        // Mark special tokens
+        let special_ids: Vec<u32> = self.special_tokens.values().copied().collect();
+        encoding.mark_special_tokens(&special_ids);
+
+        encoding
+    }
+
+    /// Add a token dynamically
+    pub fn add_token(&mut self, content: &str, id: u32, special: bool) {
+        self.added_tokens.insert(content.to_string(), id);
+        if special {
+            self.special_tokens.insert(content.to_string(), id);
+        }
+    }
+
+    /// Add multiple tokens dynamically
+    pub fn add_tokens(&mut self, tokens: Vec<(String, u32, bool)>) {
+        for (content, id, special) in tokens {
+            self.add_token(&content, id, special);
+        }
+    }
+
+    /// Set normalizer
+    pub fn set_normalizer(&mut self, normalizer: Normalizer) {
+        self.normalizer = Some(normalizer);
+    }
+
+    /// Set pre-tokenizer
+    pub fn set_pre_tokenizer(&mut self, pre_tokenizer: PreTokenizer) {
+        self.pre_tokenizer = Some(pre_tokenizer);
+    }
+
+    /// Set post-processor
+    pub fn set_post_processor(&mut self, post_processor: PostProcessor) {
+        self.post_processor = Some(post_processor);
+    }
+
+    /// Set decoder
+    pub fn set_decoder(&mut self, decoder: Decoder) {
+        self.decoder = Some(decoder);
     }
 
     /// Encode text to token IDs
@@ -193,7 +311,17 @@ impl HuggingFaceTokenizer {
 
     /// Decode token IDs to text
     pub fn decode(&self, ids: &[u32]) -> String {
-        self.bpe.decode(ids)
+        // Get tokens from IDs
+        let tokens: Vec<String> = ids
+            .iter()
+            .filter_map(|&id| self.vocab.get_token(id).map(|s| s.to_string()))
+            .collect();
+
+        // Apply decoder if set
+        match &self.decoder {
+            Some(d) => d.decode(&tokens),
+            None => self.bpe.decode(ids),
+        }
     }
 
     /// Decode batch (parallel)
@@ -260,6 +388,191 @@ impl HuggingFaceTokenizer {
 
         fs::write(path, json)
     }
+}
+
+// =============================================================================
+// JSON Parsing Helpers
+// =============================================================================
+
+/// Parse normalizer from JSON
+fn parse_normalizer(_json: &Option<serde_json::Value>) -> Option<Normalizer> {
+    // For now, default to NFC - can be extended to parse from JSON
+    Some(Normalizer::NFC)
+}
+
+/// Parse pre-tokenizer from JSON
+fn parse_pre_tokenizer(json: &Option<serde_json::Value>) -> Option<PreTokenizer> {
+    if let Some(value) = json {
+        if let Some(obj) = value.as_object() {
+            if let Some(type_val) = obj.get("type") {
+                let type_str = type_val.as_str().unwrap_or("");
+                return match type_str {
+                    "ByteLevel" => {
+                        let add_prefix = obj
+                            .get("add_prefix_space")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        Some(PreTokenizer::ByteLevel {
+                            add_prefix_space: add_prefix,
+                        })
+                    }
+                    "Metaspace" => {
+                        let replacement = obj
+                            .get("replacement")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.chars().next())
+                            .unwrap_or('▁');
+                        let add_prefix = obj
+                            .get("add_prefix_space")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        Some(PreTokenizer::Metaspace {
+                            replacement,
+                            add_prefix_space: add_prefix,
+                        })
+                    }
+                    "Whitespace" => Some(PreTokenizer::Whitespace),
+                    "Punctuation" => Some(PreTokenizer::Punctuation),
+                    _ => None,
+                };
+            }
+        }
+    }
+    // Default to ByteLevel
+    Some(PreTokenizer::ByteLevel {
+        add_prefix_space: false,
+    })
+}
+
+/// Parse post-processor from JSON
+fn parse_post_processor(
+    json: &Option<serde_json::Value>,
+    special_tokens: &HashMap<String, u32>,
+) -> Option<PostProcessor> {
+    if let Some(value) = json {
+        if let Some(obj) = value.as_object() {
+            if let Some(type_val) = obj.get("type") {
+                let type_str = type_val.as_str().unwrap_or("");
+                return match type_str {
+                    "TemplateProcessing" => {
+                        let single = obj
+                            .get("single")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| template_from_array(arr))
+                            .unwrap_or_else(|| "<s> $A </s>".to_string());
+                        let pair = obj
+                            .get("pair")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| template_from_array(arr));
+                        let tokens: Vec<(String, u32)> = special_tokens
+                            .iter()
+                            .map(|(k, v)| (k.clone(), *v))
+                            .collect();
+                        Some(PostProcessor::TemplateProcessing {
+                            single,
+                            pair,
+                            special_tokens: tokens,
+                        })
+                    }
+                    "RobertaProcessing" => {
+                        let bos = special_tokens.get("<s>").copied().unwrap_or(0);
+                        let eos = special_tokens.get("</s>").copied().unwrap_or(2);
+                        Some(PostProcessor::RobertaProcessing {
+                            bos: ("<s>".to_string(), bos),
+                            eos: ("</s>".to_string(), eos),
+                            add_prefix_space: false,
+                        })
+                    }
+                    "BertProcessing" => {
+                        let cls = special_tokens.get("[CLS]").copied().unwrap_or(101);
+                        let sep = special_tokens.get("[SEP]").copied().unwrap_or(102);
+                        Some(PostProcessor::BertProcessing {
+                            cls: ("[CLS]".to_string(), cls),
+                            sep: ("[SEP]".to_string(), sep),
+                        })
+                    }
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+/// Convert template array to string
+fn template_from_array(arr: &[serde_json::Value]) -> String {
+    arr.iter()
+        .filter_map(|item| {
+            if let Some(obj) = item.as_object() {
+                if let Some(special) = obj.get("SpecialToken") {
+                    return special
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+                if let Some(seq) = obj.get("Sequence") {
+                    return seq
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| format!("${}", s));
+                }
+            }
+            None
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Parse decoder from JSON
+fn parse_decoder(json: &Option<serde_json::Value>) -> Option<Decoder> {
+    if let Some(value) = json {
+        if let Some(obj) = value.as_object() {
+            if let Some(type_val) = obj.get("type") {
+                let type_str = type_val.as_str().unwrap_or("");
+                return match type_str {
+                    "ByteLevel" => Some(Decoder::ByteLevel),
+                    "Metaspace" => {
+                        let replacement = obj
+                            .get("replacement")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.chars().next())
+                            .unwrap_or('▁');
+                        let add_prefix = obj
+                            .get("add_prefix_space")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        Some(Decoder::Metaspace {
+                            replacement,
+                            add_prefix_space: add_prefix,
+                        })
+                    }
+                    "WordPiece" => {
+                        let prefix = obj
+                            .get("prefix")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("##")
+                            .to_string();
+                        let cleanup = obj
+                            .get("cleanup")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        Some(Decoder::WordPiece { prefix, cleanup })
+                    }
+                    "BPE" => {
+                        let suffix = obj
+                            .get("suffix")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("</w>")
+                            .to_string();
+                        Some(Decoder::BPE { suffix })
+                    }
+                    _ => None,
+                };
+            }
+        }
+    }
+    // Default to ByteLevel
+    Some(Decoder::ByteLevel)
 }
 
 #[cfg(test)]

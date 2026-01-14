@@ -44,7 +44,7 @@ fn complexity_tokenizer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPreTokenizer>()?;
     m.add_class::<PyPostProcessor>()?;
     m.add_class::<PyDecoder>()?;
-    m.add("__version__", "0.2.2")?;
+    m.add("__version__", "0.2.3")?;
     Ok(())
 }
 
@@ -122,6 +122,43 @@ impl PyTokenizer {
     fn save(&self, path: &str) -> PyResult<()> {
         self.inner.save(path)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
+    }
+
+    /// Encode text to full Encoding (with attention mask, type ids, etc.)
+    fn encode_to_encoding(&self, text: &str) -> PyEncoding {
+        PyEncoding {
+            inner: self.inner.encode_to_encoding(text),
+        }
+    }
+
+    /// Add a token dynamically
+    fn add_token(&mut self, content: &str, id: u32, special: bool) {
+        self.inner.add_token(content, id, special);
+    }
+
+    /// Add multiple tokens dynamically
+    fn add_tokens(&mut self, tokens: Vec<(String, u32, bool)>) {
+        self.inner.add_tokens(tokens);
+    }
+
+    /// Set normalizer
+    fn set_normalizer(&mut self, normalizer: &PyNormalizer) {
+        self.inner.set_normalizer(normalizer.inner.clone());
+    }
+
+    /// Set pre-tokenizer
+    fn set_pre_tokenizer(&mut self, pre_tokenizer: &PyPreTokenizer) {
+        self.inner.set_pre_tokenizer(pre_tokenizer.inner.clone());
+    }
+
+    /// Set post-processor
+    fn set_post_processor(&mut self, post_processor: &PyPostProcessor) {
+        self.inner.set_post_processor(post_processor.inner.clone());
+    }
+
+    /// Set decoder
+    fn set_decoder(&mut self, decoder: &PyDecoder) {
+        self.inner.set_decoder(decoder.inner.clone());
     }
 }
 
